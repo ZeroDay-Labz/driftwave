@@ -53,6 +53,11 @@
     <category>Player</category>
   </categories>
   <releases>
+    <release version="0.1.2" date="2026-09-26">
+      <description>
+        <p>Go+ preview tracks now play: the full song from another upload when there is one, otherwise the 30-second preview. Stricter matching so remixes and edits are never picked as replacements.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-09-26">
       <description>
         <p>Volume now matches how loud it sounds (50% is about half as loud), and KDE's media widget volume syncs both ways.</p>

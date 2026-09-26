@@ -363,28 +363,12 @@ impl SoundCloud {
         let (artist, title) = crate::lyrics::artist_and_title(track);
         let q = format!("{artist} {title}");
         let candidates: Vec<Track> = self.get_page("/search/tracks", &[("q", q.as_str()), ("limit", "50")])?;
-        let want = crate::lyrics::normalize(&title);
         let len = track.full_duration.unwrap_or(track.duration) as i64;
         let tolerance = (len / 12).max(10_000); // ~8%, at least 10 s
-        const EDITS: [&str; 17] = [
-            "remix", "rmx", "cover", "slowed", "sped", "nightcore", "reverb", "instrumental", "8d",
-            "bass boosted", "bootleg", "flip", "vip", "mashup", "rework", "refix", "edit",
-        ];
-        let original = track.title.to_lowercase();
-        let is_edit = |t: &Track| {
-            let lower = t.title.to_lowercase();
-            EDITS.iter().any(|e| lower.contains(e) && !original.contains(e))
-        };
         let mut matches: Vec<Track> = candidates
             .into_iter()
-            .filter(|t| t.id != track.id && t.is_playable() && !t.is_drm_only() && !t.is_preview() && !is_edit(t))
-            .filter(|t| {
-                // The title must be this song, give or take the artist's name
-                // and a little extra ("x Blockhead"), not a longer variant.
-                let got = crate::lyrics::normalize(&t.title);
-                let leftover = got.replacen(&want, "", 1).replacen(&crate::lyrics::normalize(&artist), "", 1);
-                got.contains(&want) && leftover.chars().count() <= 14
-            })
+            .filter(|t| t.id != track.id && t.is_playable() && !t.is_drm_only() && !t.is_preview())
+            .filter(|t| is_same_version(&track.title, &t.title, &artist, &title))
             .filter(|t| (t.duration as i64 - len).abs() <= tolerance)
             .collect();
         matches.sort_by_key(|t| ((t.duration as i64 - len).abs() / 2000, std::cmp::Reverse(t.playback_count)));
@@ -539,11 +523,15 @@ impl SoundCloud {
     fn open_mp3(&self, track: &Track) -> Result<OpenStream> {
         let t = &track.media.transcodings;
         let is_mp3 = |x: &&Transcoding| x.format.mime_type == "audio/mpeg" && !x.snipped;
+        let is_snippet = |x: &&Transcoding| x.format.mime_type == "audio/mpeg" && x.snipped;
         let mp3 = t
             .iter()
             .filter(is_mp3)
             .find(|x| x.format.protocol == "progressive")
             .or_else(|| t.iter().filter(is_mp3).find(|x| x.format.protocol == "hls"))
+            // Go+ tracks only offer a 30-second snippet: better than nothing.
+            .or_else(|| t.iter().filter(is_snippet).find(|x| x.format.protocol == "progressive"))
+            .or_else(|| t.iter().filter(is_snippet).find(|x| x.format.protocol == "hls"))
             .ok_or_else(|| anyhow!("no unencrypted stream available"))?;
         let media_url = self.stream_url(track, mp3)?;
 
@@ -640,6 +628,29 @@ impl SoundCloud {
         }
         bail!("could not find a client_id in SoundCloud's JS bundles")
     }
+}
+
+/// Is `candidate` (another upload's title) the same version of the song as
+/// `original`, not a remix, cover or edit of it? `artist`/`song` are the
+/// original's cleaned-up artist and song title.
+pub fn is_same_version(original: &str, candidate: &str, artist: &str, song: &str) -> bool {
+    use crate::lyrics::normalize;
+    let want = normalize(song);
+    let got = normalize(candidate);
+    if want.is_empty() || !got.contains(&want) {
+        return false;
+    }
+    let strip = |s: String| s.replacen(&want, "", 1).replacen(&normalize(artist), "", 1);
+    // What the candidate adds beyond the title and artist ("xblockhead",
+    // "amoredit"), minus whatever the original itself adds ("radioedit").
+    let extra = strip(got);
+    let original_extra = strip(normalize(original));
+    let residual = extra.replacen(&original_extra, "", 1).replace("originalmix", "");
+    const EDITS: [&str; 18] = [
+        "remix", "rmx", "mix", "cover", "slowed", "sped", "nightcore", "reverb", "instrumental",
+        "8d", "bassboost", "bootleg", "flip", "vip", "mashup", "rework", "refix", "edit",
+    ];
+    residual.chars().count() <= 14 && !EDITS.iter().any(|e| residual.contains(e))
 }
 
 /// File extension for a download, from Content-Disposition or Content-Type.
@@ -805,6 +816,47 @@ mod tests {
         let share = top.iter().filter(|t| tagged(t)).count() * 100 / top.len();
         println!("{share}% of top tracks carry the tag");
         assert!(share > 80);
+    }
+
+    #[test]
+    fn same_version_matching() {
+        let same = |orig: &str, cand: &str, artist: &str, song: &str| is_same_version(orig, cand, artist, song);
+        assert!(same("Trouble Trouble", "Aesop Rock x Blockhead - Trouble Trouble", "Aesop Rock", "Trouble Trouble"));
+        assert!(same("Rings", "Aesop Rock - Rings", "Aesop Rock", "Rings"));
+        assert!(same("Strobe", "deadmau5 - Strobe (Original Mix)", "deadmau5", "Strobe"));
+        assert!(same("One More Time (Radio Edit)", "One More Time (Radio Edit)", "Daft Punk", "One More Time"));
+        assert!(!same("One More Time (Radio Edit)", "Daft Punk- One More Time (Amor Edit) [FREE DL]", "Daft Punk", "One More Time"));
+        assert!(!same("Instant Crush (feat. Julian Casablancas)", "Daft Punk - Instant Crush (Atlantis Mix)", "Daft Punk", "Instant Crush"));
+        assert!(!same("None Shall Pass", "Aesop Rock - None Shall Pass (Nikora's Constant Value RMX)", "Aesop Rock", "None Shall Pass"));
+        assert!(!same("Rings", "Aesop Rock - Rings (Cover by Jon Watts)", "Aesop Rock", "Rings"));
+        assert!(!same("Daylight", "Aesop Rock - Daylight (slowed + reverb)", "Aesop Rock", "Daylight"));
+        assert!(!same("Rings", "Something Else", "Aesop Rock", "Rings"));
+    }
+
+    /// Prints what Go+ preview tracks fall back to, and checks the fallback
+    /// is the full song and actually streams.
+    #[test]
+    #[ignore]
+    fn preview_fallbacks() {
+        let sc = SoundCloud::new().unwrap();
+        let previews: Vec<Track> = sc.search_tracks("daft punk").unwrap().into_iter().filter(Track::is_preview).take(8).collect();
+        assert!(!previews.is_empty(), "no Go+ previews found to test with");
+        let mut found = 0;
+        for t in &previews {
+            match sc.playable_alternative(t).unwrap() {
+                Some(a) => {
+                    found += 1;
+                    let full = t.full_duration.unwrap_or(0) / 1000;
+                    println!("{:<24} {}s preview → {} [{}] {}s", t.title, t.duration / 1000, a.title, a.user.username, a.duration / 1000);
+                    assert!(!a.is_preview() && (a.duration / 1000).abs_diff(full) <= 30);
+                }
+                None => println!("{:<24} → (none: plays the 30 s preview)", t.title),
+            }
+        }
+        // With no full upload, the snippet itself must still stream.
+        let snippet = sc.open_stream(&previews[0]).expect("the preview snippet streams");
+        snippet.cancel();
+        assert!(found > 0);
     }
 
     #[test]

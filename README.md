@@ -186,7 +186,7 @@ there.
 | green text (`Nerdcore`, `Hardstyle`…) | the track's genre; click it (or press `t`) to browse that genre |
 | `⤓` | the uploader allows downloads; press `D` to save it (needs your session, see above) |
 | `DRM` | SoundCloud only streams it encrypted; driftwave plays another upload instead |
-| `preview` | a SoundCloud Go+ track: only 30 seconds play |
+| `preview` | a SoundCloud Go+ track: driftwave plays a full upload of it if one exists, else a 30-second preview |
 | `AAC 160k` / `MP3 128k` | the quality of what's playing |
 
 ## Troubleshooting
@@ -195,8 +195,9 @@ there.
   driftwave plays another upload of the same song when there is one. It won't pick remixes,
   covers or edits, and the status line says whose upload it chose. If there's none, it skips to
   the next track.
-- **Only 30 seconds play (`preview`)**: that's a SoundCloud Go+ track. Full playback needs a
-  subscription on SoundCloud itself.
+- **A track is marked `preview`**: it's a SoundCloud Go+ track, and SoundCloud only streams
+  30 seconds of it without a subscription. driftwave plays the full song from another upload
+  when there is one (same checks as for `DRM`), and otherwise plays the 30-second preview.
 - **Lyrics out of sync**: see [Lyrics](#lyrics). One right-click on the current line usually fixes it.
 - **No album art**: images need a terminal with graphics support (kitty, WezTerm, Konsole,
   foot…). Others show a blocky version, and tmux shows none.

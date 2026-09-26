@@ -110,6 +110,9 @@ pub struct App {
     pub quality: Option<&'static str>,
     /// Bumped on every play request so stale downloads are ignored.
     generation: u64,
+    /// A preview track with no full upload elsewhere: play its snippet
+    /// instead of searching again.
+    snippet_ok: Option<u64>,
     /// The next track, already downloading so autoplay starts instantly.
     prefetch: Option<(u64, OpenStream)>,
 
@@ -181,6 +184,7 @@ impl App {
             loading: false,
             quality: None,
             generation: 0,
+            snippet_ok: None,
             prefetch: None,
             status: String::new(),
             status_seen: String::new(),
@@ -431,10 +435,12 @@ impl App {
         self.loading = true;
         self.quality = None;
         self.player.stop();
-        if track.is_drm_only() {
-            // SoundCloud won't stream this one unencrypted; look for another
-            // upload of the same song instead.
-            self.status = format!("{} is DRM-protected; looking for another upload…", track.title);
+        let preview = track.is_preview() && self.snippet_ok != Some(track.id);
+        if track.is_drm_only() || preview {
+            // SoundCloud won't stream the whole song (DRM, or a Go+ preview);
+            // look for another upload of it instead.
+            let why = if preview { "a 30-second Go+ preview" } else { "DRM-protected" };
+            self.status = format!("{} is {why}; looking for a full upload…", track.title);
             let generation = self.generation;
             self.spawn(move |sc| Reply::Alternative {
                 generation,
@@ -1000,11 +1006,22 @@ impl App {
                     self.queue.replace_current(*alt);
                     self.play_current();
                     if let Some(t) = self.queue.current() {
+                        let why = if original.is_preview() { "only a Go+ preview" } else { "DRM-protected" };
                         self.status = format!(
-                            "\"{}\" is DRM-protected; playing {}'s upload instead",
+                            "\"{}\" is {why}; playing {}'s full upload instead",
                             original.title, t.user.username
                         );
                     }
+                }
+                _ if original.is_preview() => {
+                    // No full version anywhere: the 30-second preview is
+                    // still better than silence.
+                    self.snippet_ok = Some(original.id);
+                    self.play_current();
+                    self.status = format!(
+                        "\"{}\": only a 30-second preview is available without SoundCloud Go+",
+                        original.title
+                    );
                 }
                 _ => {
                     self.loading = false;
