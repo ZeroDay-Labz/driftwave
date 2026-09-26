@@ -24,6 +24,17 @@ use crate::hls::AacStream;
 use crate::stream::StreamReader;
 use crate::viz::{Ring, Tap};
 
+pub const DEFAULT_VOLUME: f32 = 0.6;
+
+/// Volume level (0–1, what the user sees) → amplitude gain. Loudness is
+/// perceived logarithmically, so a linear gain crams every comfortable level
+/// into the bottom 15%. The cubic curve is what PipeWire/PulseAudio and
+/// desktop volume sliders use: 50% ≈ −18 dB, 25% ≈ −36 dB, 100% = unchanged
+/// (never above, which would clip).
+pub fn gain(level: f32) -> f32 {
+    level.clamp(0.0, 1.0).powi(3)
+}
+
 /// Samples per message between decoder and audio thread (~46 ms stereo).
 const PIECE: usize = 4096;
 /// Queue capacity in pieces (~2 s of stereo 44.1 kHz).
@@ -334,7 +345,7 @@ impl Player {
         // Otherwise rodio prints to stderr on exit and scribbles over the TUI.
         device.log_on_drop(false);
         let sink = Sink::connect_new(device.mixer());
-        sink.set_volume(0.7);
+        sink.set_volume(gain(DEFAULT_VOLUME));
         Ok(Self { _device: device, sink, current: None, ring: Ring::shared() })
     }
 
@@ -409,16 +420,34 @@ impl Player {
         self.seek_to(Duration::from_millis(ms.max(0) as u64));
     }
 
+    /// Volume level, 0.0–1.0, as shown to the user (perceptual, see `gain`).
     pub fn volume(&self) -> f32 {
-        self.sink.volume()
+        self.sink.volume().max(0.0).cbrt()
     }
 
-    pub fn set_volume(&self, v: f32) {
-        self.sink.set_volume(v.clamp(0.0, 1.5));
+    pub fn set_volume(&self, level: f32) {
+        self.sink.set_volume(gain(level));
     }
 
+    /// Step the level, rounded to whole percents so repeated steps don't drift.
     pub fn change_volume(&self, delta: f32) {
-        let v = (self.volume() + delta).clamp(0.0, 1.5);
-        self.sink.set_volume(v);
+        let level = ((self.volume() + delta) * 100.0).round() / 100.0;
+        self.set_volume(level);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gain;
+
+    #[test]
+    fn volume_curve() {
+        assert_eq!(gain(0.0), 0.0);
+        assert_eq!(gain(1.0), 1.0);
+        assert!((gain(0.5) - 0.125).abs() < 1e-6, "50% ≈ −18 dB");
+        assert_eq!(gain(1.4), 1.0, "never boosts above full scale");
+        assert_eq!(gain(-0.2), 0.0);
+        let db = |l: f32| 20.0 * gain(l).log10();
+        assert!((db(0.5) + 18.06).abs() < 0.1 && (db(0.25) + 36.12).abs() < 0.1);
     }
 }

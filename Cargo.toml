@@ -28,6 +28,7 @@ serde_json = "1.0.151"
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 symphonia = { version = "0.5.5", default-features = false, features = ["aac"] }
 unicode-width = "0.2.2"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 # Audio decoding (symphonia) and FFT are far too slow unoptimized, which makes
 # plain `cargo run` stutter. Optimize dependencies even in dev builds; our own

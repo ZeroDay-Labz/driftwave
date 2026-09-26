@@ -15,7 +15,12 @@ const HISTORY_LEN: usize = 200;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
-    pub volume: f32,
+    /// Volume level shown in the app (0–1, perceptual; see `player::gain`).
+    pub volume_level: Option<f32>,
+    /// Old linear gain from before the perceptual volume; only read, to
+    /// carry the user's setting over.
+    #[serde(skip_serializing)]
+    pub volume: Option<f32>,
     pub shuffle: bool,
     pub repeat: Repeat,
     pub radio: bool,
@@ -41,7 +46,8 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            volume: 0.7,
+            volume_level: None, // set once the user changes it (see `volume()`)
+            volume: None,
             shuffle: false,
             repeat: Repeat::Off,
             radio: false,
@@ -74,10 +80,27 @@ fn path() -> Option<PathBuf> {
 impl State {
     /// Load saved state; a missing or unreadable file just means defaults.
     pub fn load() -> Self {
-        path()
+        let mut state: State = path()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.migrate();
+        state
+    }
+
+    /// The volume level to use (0–1).
+    pub fn volume(&self) -> f32 {
+        self.volume_level.unwrap_or(crate::player::DEFAULT_VOLUME)
+    }
+
+    /// Older versions saved a linear gain as `volume`. Its cube root is the
+    /// level that plays at exactly the same loudness on the new curve.
+    fn migrate(&mut self) {
+        if let Some(old) = self.volume.take()
+            && self.volume_level.is_none()
+        {
+            self.volume_level = Some(old.clamp(0.0, 1.0).cbrt());
+        }
     }
 
     pub fn save(&self) {
@@ -118,7 +141,7 @@ mod tests {
             }))
             .unwrap()
         };
-        let mut s = State { volume: 0.4, repeat: Repeat::One, ..State::default() };
+        let mut s = State { volume_level: Some(0.4), repeat: Repeat::One, ..State::default() };
         for id in [1, 2, 1, 3] {
             s.record_play(&track(id));
         }
@@ -126,12 +149,17 @@ mod tests {
         assert_eq!(ids, [3, 1, 2], "newest first, no duplicates");
 
         let back: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert_eq!(back.volume, 0.4);
+        assert_eq!(back.volume(), 0.4);
         assert_eq!(back.repeat, Repeat::One);
         assert_eq!(back.history.len(), 3);
 
         // Older/partial files still load, with defaults for missing fields.
-        let partial: State = serde_json::from_str(r#"{"volume": 0.2}"#).unwrap();
+        let mut partial: State = serde_json::from_str(r#"{"volume": 0.1}"#).unwrap();
         assert!(partial.notifications && partial.history.is_empty());
+        // An old linear volume carries over at the same loudness.
+        partial.migrate();
+        assert!((partial.volume() - 0.464).abs() < 0.001);
+        assert!((crate::player::gain(partial.volume()) - 0.1).abs() < 1e-4);
+        assert!(!serde_json::to_string(&partial).unwrap().contains("\"volume\":"), "old field isn't written back");
     }
 }

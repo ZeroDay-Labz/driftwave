@@ -167,7 +167,7 @@ pub struct App {
 impl App {
     pub fn new(sc: Arc<SoundCloud>, player: Player, query: String, state: State) -> Self {
         let (tx, rx) = mpsc::channel();
-        player.set_volume(state.volume);
+        player.set_volume(state.volume());
         let mut queue = Queue::default();
         (queue.shuffle, queue.repeat, queue.radio) = (state.shuffle, state.repeat, state.radio);
             App {
@@ -515,10 +515,10 @@ impl App {
 
     /// Mirror settings into `state` and save now and then when they change.
     fn sync_state(&mut self) {
-        let current = (self.player.volume(), self.queue.shuffle, self.queue.repeat, self.queue.radio);
-        let saved = (self.state.volume, self.state.shuffle, self.state.repeat, self.state.radio);
+        let current = (Some(self.player.volume()), self.queue.shuffle, self.queue.repeat, self.queue.radio);
+        let saved = (self.state.volume_level, self.state.shuffle, self.state.repeat, self.state.radio);
         if current != saved {
-            (self.state.volume, self.state.shuffle, self.state.repeat, self.state.radio) = current;
+            (self.state.volume_level, self.state.shuffle, self.state.repeat, self.state.radio) = current;
             self.state_dirty = true;
         }
         if self.state_dirty && self.last_save.elapsed() > Duration::from_secs(5) {
@@ -691,6 +691,7 @@ impl App {
                 _ => {}
             }
         }
+        m.set_volume(self.player.volume());
         let track = self.queue.current();
         let art = track.and_then(|t| self.art_files.get(&t.id)).map(|p| p.as_path());
         m.update(track, art, self.player.is_paused(), self.player.position());
