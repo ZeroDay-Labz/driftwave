@@ -1,6 +1,6 @@
 [package]
 name = "driftwave"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Stream SoundCloud in your terminal: synced lyrics, live visualizer, media keys"
 license = "MIT"
