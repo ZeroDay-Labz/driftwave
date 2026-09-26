@@ -1,0 +1,102 @@
+# Push a tag like v0.1.0 to build .deb, .rpm and .flatpak packages and
+# attach them to a GitHub Release.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb-rpm:
+    # Build on the oldest supported Ubuntu so the binary's glibc
+    # requirement works on as many distros as possible.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: .deb
+        run: cargo deb --no-build
+      - name: .rpm
+        run: cargo generate-rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-rpm
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+
+  flatpak-sources:
+    # Flatpak builds offline, so pre-resolve every crate from Cargo.lock.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate cargo-sources.json
+        run: |
+          pip install aiohttp toml tomlkit
+          curl -sSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          python3 flatpak-cargo-generator.py Cargo.lock -o packaging/cargo-sources.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-sources
+          path: packaging/cargo-sources.json
+
+  flatpak:
+    needs: flatpak-sources
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-sources
+          path: packaging
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: driftwave.flatpak
+          manifest-path: packaging/io.github.ZeroDay_Labz.driftwave.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: driftwave.flatpak
+
+  release:
+    needs: [deb-rpm, flatpak]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          find . -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.flatpak' \) -exec mv {} . \;
+          sha256sum *.deb *.rpm *.flatpak > SHA256SUMS
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.flatpak
+            dist/SHA256SUMS

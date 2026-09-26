@@ -1,0 +1,38 @@
+# Flatpak manifest. CI generates packaging/cargo-sources.json from Cargo.lock
+# (flatpak-cargo-generator.py) so the build can run offline, as Flatpak requires.
+id: io.github.ZeroDay_Labz.driftwave
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: driftwave
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=pulseaudio
+  # Desktop notifications and media keys / KDE media widget (MPRIS).
+  - --talk-name=org.freedesktop.Notifications
+  - --own-name=org.mpris.MediaPlayer2.driftwave
+  # Opening the lyrics pop-out in the host's terminal (flatpak-spawn --host).
+  - --talk-name=org.freedesktop.Flatpak
+  # Default library folder (~/Music/driftwave).
+  - --filesystem=xdg-music
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/driftwave/cargo
+modules:
+  - name: driftwave
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/driftwave -t /app/bin/
+      - install -Dm644 packaging/io.github.ZeroDay_Labz.driftwave.desktop -t /app/share/applications/
+      - install -Dm644 packaging/io.github.ZeroDay_Labz.driftwave.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 packaging/io.github.ZeroDay_Labz.driftwave.metainfo.xml -t /app/share/metainfo/
+    sources:
+      - type: dir
+        path: ..
+      - cargo-sources.json

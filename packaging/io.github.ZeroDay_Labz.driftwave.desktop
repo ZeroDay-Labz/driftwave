@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=driftwave
+GenericName=Music Player
+Comment=Stream SoundCloud in your terminal, with synced lyrics and a live visualizer
+Exec=driftwave
+Icon=io.github.ZeroDay_Labz.driftwave
+Terminal=true
+Categories=AudioVideo;Audio;Player;ConsoleOnly;
+Keywords=soundcloud;music;player;stream;lyrics;terminal;tui;
+StartupNotify=false

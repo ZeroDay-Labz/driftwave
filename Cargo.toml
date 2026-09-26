@@ -1,0 +1,74 @@
+[package]
+name = "driftwave"
+version = "0.1.0"
+edition = "2024"
+description = "Stream SoundCloud in your terminal: synced lyrics, live visualizer, media keys"
+license = "MIT"
+repository = "https://github.com/ZeroDay-Labz/driftwave"
+homepage = "https://github.com/ZeroDay-Labz/driftwave"
+readme = "README.md"
+keywords = ["soundcloud", "music", "player", "tui", "lyrics"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+dirs = "7.0.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+notify-rust = "4.18.0"
+ratatui = "0.30.2"
+ratatui-image = { version = "12.0.0-rc.0", default-features = false, features = ["crossterm"] }
+regex = "1.13.1"
+reqwest = { version = "0.13.5", features = ["blocking", "json", "query"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-aac", "symphonia-isomp4"] }
+rustfft = "6.4.1"
+scraper = "0.27.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["aac"] }
+unicode-width = "0.2.2"
+
+# Audio decoding (symphonia) and FFT are far too slow unoptimized, which makes
+# plain `cargo run` stutter. Optimize dependencies even in dev builds; our own
+# code stays quick to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.deb]
+maintainer = "ZeroDay Labz"
+section = "sound"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+A terminal music player for SoundCloud: search, full artist catalogs, AAC streaming, \
+queue/shuffle/radio, synced lyrics with a pop-out window, album art, media keys \
+and desktop notifications. No account needed."""
+assets = [
+    ["target/release/driftwave", "usr/bin/", "755"],
+    ["packaging/io.github.ZeroDay_Labz.driftwave.desktop", "usr/share/applications/", "644"],
+    ["packaging/io.github.ZeroDay_Labz.driftwave.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["packaging/io.github.ZeroDay_Labz.driftwave.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["README.md", "usr/share/doc/driftwave/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/driftwave", dest = "/usr/bin/driftwave", mode = "755" },
+    { source = "packaging/io.github.ZeroDay_Labz.driftwave.desktop", dest = "/usr/share/applications/io.github.ZeroDay_Labz.driftwave.desktop", mode = "644" },
+    { source = "packaging/io.github.ZeroDay_Labz.driftwave.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.ZeroDay_Labz.driftwave.svg", mode = "644" },
+    { source = "packaging/io.github.ZeroDay_Labz.driftwave.metainfo.xml", dest = "/usr/share/metainfo/io.github.ZeroDay_Labz.driftwave.metainfo.xml", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/driftwave/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/driftwave/LICENSE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+alsa-lib = "*"
