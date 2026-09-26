@@ -83,13 +83,15 @@ pub fn find(artist: &str, title: &str) -> Result<Option<GeniusResult>> {
         .collect();
 
     let (want_title, want_artist) = (normalize(title), normalize(artist));
-    let matches = |a: &str, b: &str| !a.is_empty() && !b.is_empty() && (a.contains(b) || b.contains(a));
+    let matches = crate::lyrics::names_match;
     let Some(song) = songs.into_iter().enumerate().find_map(|(i, s)| {
-        let title_ok = matches(&normalize(&s.title), &want_title);
+        let got_title = normalize(&s.title);
+        let title_ok = matches(&got_title, &want_title);
         let artist_ok = matches(&normalize(&s.primary_artist.name), &want_artist);
         // The top hit may be credited differently ("deadmau5 & Lights" vs
-        // "deadmau5"); further down, require the artist to match too.
-        (title_ok && (artist_ok || i == 0)).then_some(s)
+        // "deadmau5"), but then the title must match exactly: otherwise
+        // "Research" by one artist finds "Unnatural Research" by another.
+        (title_ok && (artist_ok || (i == 0 && got_title == want_title))).then_some(s)
     }) else {
         return Ok(None);
     };

@@ -154,9 +154,17 @@ fn find_online(track: &Track, lookup: &Lookup) -> Result<Option<Found>> {
     if let Ok(Some(found)) = lrclib {
         return Ok(Some(found));
     }
+    // Real lyrics only: some entries are bios or summaries, not lyrics.
+    let lrclib = match lrclib {
+        Ok(Some(Found { lyrics: Lyrics::Plain(ref text), .. })) if looks_like_prose(text) => Ok(None),
+        other => other,
+    };
     if lookup.genius
         && let Ok(Some(g)) = crate::genius::find(&artist, &title)
     {
+        if g.text.as_deref().is_some_and(looks_like_prose) {
+            return lrclib;
+        }
         // Genius knows the song's real name; LRCLIB may have it synced
         // under that even though the SoundCloud title didn't match.
         if (g.artist != artist || g.title != title)
@@ -196,9 +204,14 @@ fn find_lrclib(track: &Track, artist: &str, title: &str) -> Result<Option<Found>
     }
 
     let want = normalize(&title);
+    let want_artist = normalize(&artist);
     candidates.retain(|r| {
         let got = normalize(&r.track_name);
-        !got.is_empty() && (got.contains(&want) || want.contains(&got))
+        // Same song: the title matches, and so does the artist (any of a
+        // "A, B & C" list), unless the title is an exact match.
+        let artist_ok = r.artist_name.split([',', '&', ';']).chain([r.artist_name.as_str()])
+            .any(|a| names_match(&normalize(a), &want_artist));
+        names_match(&got, &want) && (artist_ok || got == want)
     });
     let diff = |r: &Record| (r.duration - secs).abs();
     candidates.sort_by(|a, b| diff(a).total_cmp(&diff(b)));
@@ -246,6 +259,14 @@ fn found(r: &Record, lyrics: Lyrics, note: Option<&str>) -> Found {
 
 fn search(params: &[(&str, &str)]) -> Result<Vec<Record>> {
     Ok(http().get(format!("{LRCLIB}/search")).query(params).send()?.error_for_status()?.json()?)
+}
+
+/// Do two normalized names refer to the same thing? One containing the other
+/// counts ("deadmau5" in "deadmau5lights"), but only for names of 4+
+/// characters: a 1-letter uploader name like "g" is "in" almost anything.
+pub fn names_match(a: &str, b: &str) -> bool {
+    let shorter = a.chars().count().min(b.chars().count());
+    !a.is_empty() && (a == b || (shorter >= 4 && (a.contains(b) || b.contains(a))))
 }
 
 pub fn normalize(s: &str) -> String {
@@ -324,6 +345,24 @@ pub fn estimate_with_anchors(text: &str, duration_ms: u64, anchors: &[(usize, u6
     lines
 }
 
+/// True when "lyrics" are really prose: artist descriptions, bios or
+/// summaries ("YTCracker: Widely recognized as a pioneer of …"). Real lyrics
+/// are short lines that rarely read as full sentences.
+pub fn looks_like_prose(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !is_section_header(l))
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let labelled = Regex::new(r"^[^:]{2,40}: [A-Z].{40,}$").unwrap();
+    let described = lines.iter().filter(|l| labelled.is_match(l)).count();
+    let sentences = lines.iter().filter(|l| l.chars().count() > 70 && l.ends_with('.')).count();
+    (described >= 2 && described * 3 >= lines.len()) || (lines.len() >= 3 && sentences * 10 >= lines.len() * 6)
+}
+
 pub fn is_section_header(line: &str) -> bool {
     line.starts_with('[') && line.ends_with(']')
 }
@@ -371,6 +410,35 @@ mod tests {
     }
 
     #[test]
+    fn prose_is_not_lyrics() {
+        let bio = "YTCracker: Widely recognized as a pioneer of the hackercore subgenre and heavily ingrained in internet and hacker culture.\n\nDual Core: A definitive infosec and hackcore duo known for their deep technical references and performances at major cybersecurity conferences.\n\nYung Innanet: A prominent artist within the contemporary hackcore space.";
+        assert!(looks_like_prose(bio));
+        let lyrics = "[Verse 1]\nSpit these bars like it's my god damn job\nBut i get it with computer - delete entries from these logs\nI'm a gray hat: i determine what is right or wrong\n\n[Chorus]\nAddress resolution protocol";
+        assert!(!looks_like_prose(lyrics));
+        assert!(!looks_like_prose(""));
+    }
+
+    /// No false positives on real lyrics:
+    /// `LYRICS_DIR=~/Music/driftwave/Lyrics cargo test real_lyrics -- --ignored`
+    #[test]
+    #[ignore]
+    fn real_lyrics_are_not_prose() {
+        let Ok(dir) = std::env::var("LYRICS_DIR") else { return };
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let text = if entry.path().extension().is_some_and(|e| e == "lrc") {
+                parse_lrc(&text).into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+            } else {
+                text
+            };
+            assert!(!looks_like_prose(&text), "flagged as prose: {}", entry.path().display());
+            checked += 1;
+        }
+        println!("{checked} lyric files, none flagged");
+    }
+
+    #[test]
     fn pinned_lines() {
         let text = "a line\nb line\nc line\nd line\ne line";
         let plain = estimate_with_anchors(text, 100_000, &[]);
@@ -394,6 +462,30 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(artist_and_title(&t), ("CunninLynguists".into(), "Castles".into()));
+    }
+
+    /// Diagnostic: what lyrics lookups return for a genre's tracks.
+    #[test]
+    #[ignore]
+    fn probe_hackercore() {
+        let sc = crate::api::SoundCloud::new().unwrap();
+        let lookup = Lookup { genius: true, library: None, save: false };
+        for t in sc.tag_tracks("hackercore").unwrap().iter().take(25) {
+            let res = find(t, &lookup);
+            let desc = match &res {
+                Ok(Some(f)) => {
+                    let first = match &f.lyrics {
+                        Lyrics::Plain(t) => t.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string(),
+                        Lyrics::Synced(l) => l.first().map(|x| x.1.clone()).unwrap_or_default(),
+                        Lyrics::Instrumental => "(instrumental)".into(),
+                    };
+                    format!("{} | {} | {}", f.source, f.matched, first.chars().take(70).collect::<String>())
+                }
+                Ok(None) => "-".into(),
+                Err(e) => format!("error {e}"),
+            };
+            println!("{:<34} {}", t.title.chars().take(34).collect::<String>(), desc);
+        }
     }
 
     /// Hits lrclib.net: `cargo test -- --ignored`
