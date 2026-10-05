@@ -45,7 +45,9 @@ pub struct State {
     pub favorites: Vec<Track>,
     /// Where the music plays (see `output`).
     pub output: crate::output::Output,
-    /// With the virtual microphone: also play on the speakers, and mix the
+    /// Also send the music to a virtual microphone for other apps.
+    pub virtual_mic: bool,
+    /// With the virtual microphone: also play on `output`, and mix the
     /// real microphone in.
     pub hear_too: bool,
     pub mix_mic: bool,
@@ -71,6 +73,7 @@ impl Default for State {
             history: Vec::new(),
             favorites: Vec::new(),
             output: Default::default(),
+            virtual_mic: false,
             hear_too: true,
             mix_mic: false,
         }
@@ -176,19 +179,21 @@ mod tests {
         assert!(s.toggle_favorite(&track(5)) && s.toggle_favorite(&track(6)));
         assert!(!s.toggle_favorite(&track(5)), "a second time removes it");
         assert!(s.toggle_favorite(&track(7)) && s.is_favorite(6) && !s.is_favorite(5));
-        s.output = crate::output::Output::VirtualMic;
+        s.output = crate::output::Output::Device("card".into());
+        s.virtual_mic = true;
 
         let back: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.volume(), 0.4);
         assert_eq!(back.repeat, Repeat::One);
         assert_eq!(back.history.len(), 3);
         assert_eq!(back.favorites.iter().map(|t| t.id).collect::<Vec<_>>(), [7, 6], "newest first");
-        assert_eq!(back.output, crate::output::Output::VirtualMic);
+        assert!(back.output == crate::output::Output::Device("card".into()) && back.virtual_mic);
 
         // Older/partial files still load, with defaults for missing fields.
         let mut partial: State = serde_json::from_str(r#"{"volume": 0.1}"#).unwrap();
         assert!(partial.notifications && partial.history.is_empty());
         assert!(partial.favorites.is_empty() && partial.hear_too && partial.output == Default::default());
+        assert!(!partial.virtual_mic);
         // An old linear volume carries over at the same loudness.
         partial.migrate();
         assert!((partial.volume() - 0.464).abs() < 0.001);

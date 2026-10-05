@@ -133,8 +133,8 @@ echo "audio output"
 run "'#synthwave'"
 play_first_ok
 tm send-keys -t app O; wait_s 3
-# Only move the cursor to the virtual microphone: choosing it would create
-# real devices and, with "hear it too", play on the speakers.
+# Only move the cursor to the virtual microphone: switching it on would
+# create real devices and, with "hear it too", play on the speakers.
 for _ in $(seq 1 12); do tm send-keys -t app Down; done
 wait_s 0.5
 liveliest output

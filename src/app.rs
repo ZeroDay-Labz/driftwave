@@ -229,7 +229,7 @@ impl App {
             routing: Default::default(),
             output_busy: false,
             // Left alone unless the user chose something.
-            output_wanted: state.output != Output::Default,
+            output_wanted: state.output != Output::Default || state.virtual_mic,
             output_tries: OUTPUT_TRIES,
             output_next: Instant::now(),
             output_send: None,
@@ -801,7 +801,7 @@ impl App {
     /// The Audio tab's rows right now.
     pub fn audio_rows(&self) -> Vec<Row> {
         match &self.outputs {
-            Some(Ok(snap)) => output::rows(snap, &self.state.output),
+            Some(Ok(snap)) => output::rows(snap, &self.state.output, self.state.virtual_mic),
             _ => Vec::new(),
         }
     }
@@ -822,11 +822,12 @@ impl App {
     /// Enter on an Audio row: choose that output, or flip the option.
     fn activate_audio_row(&mut self) {
         let Some(Ok(snap)) = &self.outputs else { return };
-        let Some(&row) = output::rows(snap, &self.state.output).get(self.audio_sel) else { return };
+        let rows = output::rows(snap, &self.state.output, self.state.virtual_mic);
+        let Some(&row) = rows.get(self.audio_sel) else { return };
         match row {
             Row::Default => self.state.output = Output::Default,
             Row::Device(i) => self.state.output = Output::Device(snap.sinks[i].name.clone()),
-            Row::VirtualMic => self.state.output = Output::VirtualMic,
+            Row::VirtualMic => self.state.virtual_mic = !self.state.virtual_mic,
             Row::HearToo => self.state.hear_too = !self.state.hear_too,
             Row::MixMic => self.state.mix_mic = !self.state.mix_mic,
             Row::App(i) => {
@@ -844,13 +845,17 @@ impl App {
 
     /// Where the music is going, when that isn't simply the default device.
     pub fn output_label(&self) -> Option<String> {
-        match &self.state.output {
+        let device = match &self.state.output {
             Output::Default => None,
-            Output::VirtualMic => Some("virtual mic".into()),
             Output::Device(name) => Some(match &self.outputs {
                 Some(Ok(snap)) => snap.description(name).to_string(),
                 _ => name.clone(),
             }),
+        };
+        match (device, self.state.virtual_mic) {
+            (device, false) => device,
+            (Some(device), true) if self.state.hear_too => Some(format!("virtual mic + {device}")),
+            (_, true) => Some("virtual mic".into()),
         }
     }
 
@@ -868,6 +873,7 @@ impl App {
             (self.output_wanted, applied) = (false, true);
             Some(output::Change::Apply {
                 output: self.state.output.clone(),
+                virtual_mic: self.state.virtual_mic,
                 hear_too: self.state.hear_too,
                 mix_mic: self.state.mix_mic,
             })
@@ -906,12 +912,16 @@ impl App {
                 } else if let Some(note) = note {
                     self.status = note;
                 } else if applying {
-                    let to = match &self.state.output {
+                    let device = match &self.state.output {
                         Output::Default => format!("system default ({})", snap.description(&snap.default_sink)),
                         Output::Device(name) => snap.description(name).to_string(),
-                        Output::VirtualMic => "virtual microphone (\"driftwave\" in other apps)".into(),
                     };
-                    self.status = format!("Output: {to}");
+                    let mic = "virtual microphone (\"driftwave\" in other apps)";
+                    self.status = match (self.state.virtual_mic, self.state.hear_too) {
+                        (false, _) => format!("Output: {device}"),
+                        (true, true) => format!("Output: {device} + {mic}"),
+                        (true, false) => format!("Output: {mic} only"),
+                    };
                 }
                 self.outputs = Some(Ok(snap));
                 let rows = self.audio_rows();

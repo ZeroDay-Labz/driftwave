@@ -188,10 +188,12 @@ Press `O` (or open Settings and switch to the **Audio** tab) to choose where the
 It switches right away, mid-song, and is remembered.
 
 - **System default** or any **sound card**: headset, speakers, HDMI…
-- **Virtual microphone**: creates an input device called `driftwave` that carries the music.
-  Pick it as the microphone in Discord, a softphone or any other app, and the people there
-  hear what you play.
-  - *Hear it on my speakers too* keeps the music audible for you as well.
+- **Virtual microphone**: a switch, on top of the device you chose. It creates an input device
+  called `driftwave` that carries the music. Pick it as the microphone in Discord, a softphone
+  or any other app, and the people there hear what you play while you keep hearing it on your
+  own device.
+  - *Hear it on my speakers too* (on by default) keeps the music on the device you chose; turn
+    it off to send the music only to the other app.
   - *Mix in my microphone* adds your real microphone, so they hear you and the music.
   - *Send to an app that is recording now* lists apps that are in a call and switches one over
     without touching its settings. Turning it off, or quitting driftwave, puts its own

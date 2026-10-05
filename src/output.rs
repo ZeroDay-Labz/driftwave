@@ -1,5 +1,5 @@
-//! Where the music goes: a sound card, or a virtual microphone other apps
-//! (Discord, a softphone…) can record from.
+//! Where the music goes: a sound card, and optionally a virtual microphone
+//! other apps (Discord, a softphone…) can record from as well.
 //!
 //! The audio stream itself never changes: it is opened once on the default
 //! device and then moved around inside PipeWire/PulseAudio with `pactl`, so
@@ -7,7 +7,7 @@
 //!
 //!   driftwave ──► driftwave_<pid> (null sink) ──► driftwave_mic_<pid> (source)
 //!                        │                               ▲ apps record here
-//!                        └─► loopback ─► speakers ("hear it too")
+//!                        └─► loopback ─► the chosen device ("hear it too")
 //!
 //! Everything here blocks on `pactl`, so call it from a background thread.
 
@@ -24,13 +24,13 @@ const PREFIX: &str = "driftwave_";
 
 #[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
 pub enum Output {
-    /// Wherever the system plays sound.
+    /// Wherever the system plays sound. (0.1.3 had the virtual microphone
+    /// as a third choice here; it is its own switch now.)
     #[default]
+    #[serde(alias = "VirtualMic")]
     Default,
     /// A sound card, by its PipeWire/PulseAudio sink name.
     Device(String),
-    /// A microphone other apps can pick as their input.
-    VirtualMic,
 }
 
 pub struct Sink {
@@ -65,7 +65,7 @@ impl Snapshot {
 }
 
 pub enum Change {
-    Apply { output: Output, hear_too: bool, mix_mic: bool },
+    Apply { output: Output, virtual_mic: bool, hear_too: bool, mix_mic: bool },
     /// Point a recording app at the virtual microphone, or back.
     Send { recorder: u32, on: bool },
 }
@@ -235,49 +235,55 @@ fn relink(slot: &mut Option<(u32, String)>, want: Option<String>, args: impl Fn(
 
 impl Routing {
     /// Returns a note for the user when the choice couldn't be honoured.
-    fn apply(&mut self, want: &Output, hear_too: bool, mix_mic: bool, snap: &Snapshot) -> Result<Option<String>> {
+    fn apply(
+        &mut self,
+        want: &Output,
+        virtual_mic: bool,
+        hear_too: bool,
+        mix_mic: bool,
+        snap: &Snapshot,
+    ) -> Result<Option<String>> {
         let Some((input, _)) = snap.our_input else { return Ok(None) };
         let input = input.to_string();
-        match want {
-            Output::VirtualMic => {
-                let (sink, mic) = (sink_name(), mic_name());
-                if self.null.is_none() {
-                    let name = format!("sink_name={sink}");
-                    self.null = Some(load(&["module-null-sink", &name, "sink_properties=device.description=driftwave"])?);
-                }
-                if self.mic.is_none() {
-                    // Apps like Discord hide ".monitor" sources, so give
-                    // them a proper one.
-                    let (master, name) = (format!("master={sink}.monitor"), format!("source_name={mic}"));
-                    self.mic = Some(load(&[
-                        "module-remap-source",
-                        &master,
-                        &name,
-                        "source_properties=device.description=driftwave",
-                    ])?);
-                }
-                pactl(&["move-sink-input", &input, &sink])?;
-                let nonempty = |s: &String| !s.is_empty();
-                let speakers = hear_too.then(|| snap.default_sink.clone()).filter(nonempty);
-                relink(&mut self.hear, speakers, |to| [format!("source={sink}.monitor"), format!("sink={to}")])?;
-                let voice = mix_mic.then(|| snap.default_source.clone()).filter(nonempty);
-                relink(&mut self.mix, voice, |from| [format!("source={from}"), format!("sink={sink}")])?;
-                Ok(None)
+        // The chosen sound card, when it is connected.
+        let device = match want {
+            Output::Device(name) if snap.sinks.iter().any(|s| s.name == *name) => Some(name.clone()),
+            _ => None,
+        };
+        let note = match want {
+            Output::Device(name) if device.is_none() => {
+                Some(format!("{name} isn't connected; playing on the system default"))
             }
-            Output::Device(name) if snap.sinks.iter().any(|s| s.name == *name) => {
-                pactl(&["move-sink-input", &input, name])?;
-                self.drop_virtual();
-                Ok(None)
+            _ => None,
+        };
+        if virtual_mic {
+            let (sink, mic) = (sink_name(), mic_name());
+            if self.null.is_none() {
+                let name = format!("sink_name={sink}");
+                self.null = Some(load(&["module-null-sink", &name, "sink_properties=device.description=driftwave"])?);
             }
-            other => {
-                pactl(&["move-sink-input", &input, "@DEFAULT_SINK@"])?;
-                self.drop_virtual();
-                Ok(match other {
-                    Output::Device(name) => Some(format!("{name} isn't connected; playing on the system default")),
-                    _ => None,
-                })
+            if self.mic.is_none() {
+                // Apps like Discord hide ".monitor" sources, so give
+                // them a proper one.
+                let (master, name) = (format!("master={sink}.monitor"), format!("source_name={mic}"));
+                self.mic = Some(load(&[
+                    "module-remap-source",
+                    &master,
+                    &name,
+                    "source_properties=device.description=driftwave",
+                ])?);
             }
+            pactl(&["move-sink-input", &input, &sink])?;
+            let nonempty = |s: &String| !s.is_empty();
+            let speakers = hear_too.then(|| device.unwrap_or_else(|| snap.default_sink.clone())).filter(nonempty);
+            relink(&mut self.hear, speakers, |to| [format!("source={sink}.monitor"), format!("sink={to}")])?;
+            let voice = mix_mic.then(|| snap.default_source.clone()).filter(nonempty);
+            relink(&mut self.mix, voice, |from| [format!("source={from}"), format!("sink={sink}")])?;
+        } else {
+            pactl(&["move-sink-input", &input, device.as_deref().unwrap_or("@DEFAULT_SINK@")])?;
+            self.drop_virtual();
         }
+        Ok(note)
     }
 
     fn send(&mut self, recorder: u32, on: bool, snap: &Snapshot) -> Result<()> {
@@ -324,7 +330,9 @@ pub fn sync(routing: &Mutex<Routing>, change: Option<Change>) -> Result<(Snapsho
     let Some(change) = change else { return Ok((snap, None)) };
     let mut routing = routing.lock().unwrap();
     let note = match change {
-        Change::Apply { output, hear_too, mix_mic } => routing.apply(&output, hear_too, mix_mic, &snap)?,
+        Change::Apply { output, virtual_mic, hear_too, mix_mic } => {
+            routing.apply(&output, virtual_mic, hear_too, mix_mic, &snap)?
+        }
         Change::Send { recorder, on } => {
             routing.send(recorder, on, &snap)?;
             None
@@ -355,6 +363,7 @@ pub enum Row {
     Device(usize),
     /// The saved device, which isn't connected right now.
     Missing,
+    /// The switch that also sends the music to the virtual microphone.
     VirtualMic,
     HearToo,
     MixMic,
@@ -368,14 +377,14 @@ impl Row {
     }
 }
 
-pub fn rows(snap: &Snapshot, current: &Output) -> Vec<Row> {
+pub fn rows(snap: &Snapshot, current: &Output, virtual_mic: bool) -> Vec<Row> {
     let mut rows = vec![Row::Heading("Play through"), Row::Default];
     rows.extend((0..snap.sinks.len()).map(Row::Device));
     if matches!(current, Output::Device(name) if !snap.sinks.iter().any(|s| s.name == *name)) {
         rows.push(Row::Missing);
     }
-    rows.push(Row::VirtualMic);
-    if *current == Output::VirtualMic {
+    rows.extend([Row::Note(""), Row::Heading("Also send it to other apps"), Row::VirtualMic]);
+    if virtual_mic {
         rows.extend([Row::HearToo, Row::MixMic, Row::Heading("Send to an app that is recording now")]);
         if snap.recorders.is_empty() {
             rows.push(Row::Note("(none: start a call, or pick \"driftwave\" as the app's input device)"));
@@ -448,16 +457,19 @@ mod tests {
             our_input: None,
         };
         assert_eq!(snap.description(&snap.default_sink), "Headset Analog Stereo");
-        let plain = rows(&snap, &Output::Default);
-        assert_eq!(plain[1..], [Row::Default, Row::Device(0), Row::Device(1), Row::VirtualMic]);
+        let plain = rows(&snap, &Output::Default, false);
+        assert_eq!(plain[1..4], [Row::Default, Row::Device(0), Row::Device(1)]);
+        assert_eq!(plain.last(), Some(&Row::VirtualMic));
         assert!(!plain[0].selectable() && plain[1].selectable());
         // An unplugged saved device stays visible; the microphone's options
-        // only show while it is chosen.
-        assert!(rows(&snap, &Output::Device("gone".into())).contains(&Row::Missing));
-        let mic = rows(&snap, &Output::VirtualMic);
-        assert!(mic.contains(&Row::HearToo) && mic.contains(&Row::MixMic) && !mic.contains(&Row::Missing));
+        // only show while it is on, and the devices stay there to choose from.
+        assert!(rows(&snap, &Output::Device("gone".into()), false).contains(&Row::Missing));
+        assert!(!plain.contains(&Row::HearToo));
+        let mic = rows(&snap, &Output::Default, true);
+        assert!(mic.contains(&Row::HearToo) && mic.contains(&Row::MixMic) && mic.contains(&Row::Device(1)));
 
         let saved = serde_json::to_string(&Output::Device("x".into())).unwrap();
         assert_eq!(serde_json::from_str::<Output>(&saved).unwrap(), Output::Device("x".into()));
+        assert_eq!(serde_json::from_str::<Output>(r#""VirtualMic""#).unwrap(), Output::Default, "a 0.1.3 state file");
     }
 }

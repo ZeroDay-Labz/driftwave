@@ -423,7 +423,7 @@ fn draw_audio(frame: &mut Frame, app: &mut App, block: Block, area: Rect) {
         }
     };
     let st = &app.state;
-    let list = crate::output::rows(snap, &st.output);
+    let list = crate::output::rows(snap, &st.output, st.virtual_mic);
     let rows = Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: (list.len() as u16).min(inner.height.saturating_sub(1)) };
     app.hits.settings_rows = rows;
     let choice = |on: bool, label: String| {
@@ -452,10 +452,11 @@ fn draw_audio(frame: &mut Frame, app: &mut App, block: Block, area: Rect) {
                 let name = if let Output::Device(name) = &st.output { name.as_str() } else { "" };
                 choice(true, format!("{name} (not connected: using the system default)"))
             }
-            Row::VirtualMic => choice(
-                st.output == Output::VirtualMic,
-                "Virtual microphone → other apps (Discord, softphones…)".into(),
-            ),
+            Row::VirtualMic => {
+                let on = st.virtual_mic;
+                let value = if on { Span::raw("● on").fg(LIME).bold() } else { Span::raw("○ off").fg(MUTED) };
+                vec![Span::raw(format!("{:<34} ", "Virtual microphone (Discord, calls…)")).fg(TEXT), value]
+            }
             Row::HearToo => option(st.hear_too, "Hear it on my speakers too"),
             Row::MixMic => option(st.mix_mic, "Mix in my microphone"),
             Row::App(n) => option(snap.recorders[n].sent, &snap.recorders[n].app),
@@ -471,10 +472,11 @@ fn draw_audio(frame: &mut Frame, app: &mut App, block: Block, area: Rect) {
     if help_y < inner.bottom() {
         let text = match list.get(app.audio_sel) {
             Some(Row::VirtualMic) => {
-                "Creates an input device called \"driftwave\" that carries the music. Choose it as the \
-                 microphone in Discord, a softphone or any other app. It disappears when driftwave quits."
+                "Creates an input device called \"driftwave\" that carries the music, while you keep \
+                 hearing it on the device chosen above. Choose it as the microphone in Discord, a softphone \
+                 or any other app. It disappears when driftwave quits."
             }
-            Some(Row::HearToo) => "Also play the music on the system's default output, so you hear what the others hear.",
+            Some(Row::HearToo) => "Keep playing the music on the device chosen above, so you hear what the others hear.",
             Some(Row::MixMic) => {
                 "Add your real (default) microphone to the virtual one, so the others hear you and the music."
             }
