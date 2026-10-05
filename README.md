@@ -49,6 +49,11 @@
   <img src="docs/screenshots/lyrics.png" alt="Synced lyrics following the song" width="49%">
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/favorites.png" alt="The favorites list" width="49%">
+  <img src="docs/screenshots/output.png" alt="Choosing the audio output, with the virtual microphone" width="49%">
+</p>
+
 ## Install
 
 Download the latest package from [Releases](https://github.com/ZeroDay-Labz/driftwave/releases):

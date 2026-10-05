@@ -3,7 +3,8 @@
 # driftwave runs in hidden tmux sessions with audio going to a temporary silent
 # PipeWire sink, and each screen is rendered to PNG by render.py.
 #
-#   scripts/screenshots/capture.sh
+#   scripts/screenshots/capture.sh              # all of them
+#   scripts/screenshots/capture.sh favorites    # only these: player genre lyrics favorites output
 #
 # Needs: tmux, pactl (PipeWire/PulseAudio), python3 + Pillow, and a built
 # target/release/driftwave (it builds one if missing).
@@ -16,6 +17,8 @@ BIN="$ROOT/target/release/driftwave"
 RENDER="$ROOT/scripts/screenshots/render.py"
 SOCK="driftwave-shots"
 W=150 H=42
+ONLY=" $* "
+want() { [ "$ONLY" = "  " ] || [[ "$ONLY" == *" $1 "* ]]; }
 
 [ -x "$BIN" ] || cargo build --release --manifest-path "$ROOT/Cargo.toml"
 mkdir -p "$OUT" "$ENV/home/.config" "$ENV/ans"
@@ -71,14 +74,17 @@ liveliest() {  # capture a few frames, keep the one with the most visualizer bar
     done
 }
 
-echo "1/4 player"
+if want player; then
+echo "player"
 run "'#synthwave'"
 play_first_ok
 wait_s 6
 liveliest player
 python3 "$RENDER" "$OUT/player.png" "$ENV/ans/player.ans" --title "driftwave"
+fi
 
-echo "2/4 genre page"
+if want genre; then
+echo "genre page"
 run "'#nerdcore'"
 play_first_ok
 for _ in 1 2 3; do tm send-keys -t app Right; done  # past the quiet intro
@@ -86,8 +92,10 @@ wait_s 4
 tm send-keys -t app Home; wait_s 0.3
 liveliest genre
 python3 "$RENDER" "$OUT/genre.png" "$ENV/ans/genre.ans" --title "driftwave — #nerdcore"
+fi
 
-echo "3/4 synced lyrics"
+if want lyrics; then
+echo "synced lyrics"
 # The official upload is DRM-only, so this also shows driftwave switching to
 # the label's playable upload.
 run aesop rock rings
@@ -99,7 +107,7 @@ tm send-keys -t app l; wait_s 2
 liveliest lyrics
 python3 "$RENDER" "$OUT/lyrics.png" "$ENV/ans/lyrics.ans" --title "driftwave"
 
-echo "4/4 pop-out lyrics window"
+echo "pop-out lyrics window"
 tm send-keys -t app Escape; wait_s 0.3
 tm send-keys -t app L; wait_s 3
 for _ in 1 2 3; do tm send-keys -t app Right; done
@@ -108,5 +116,29 @@ grab app popout-player
 tm capture-pane -e -p -t lyrics > "$ENV/ans/popout-lyrics.ans"
 python3 "$RENDER" "$OUT/popout.png" "$ENV/ans/popout-player.ans" --title "driftwave" \
     "$ENV/ans/popout-lyrics.ans" --title "driftwave lyrics"
+fi
+
+if want favorites; then
+echo "favorites"
+run "'#synthwave'"
+play_first_ok
+for _ in 1 2 3 4 5 6; do tm send-keys -t app f Down Down; wait_s 0.2; done
+tm send-keys -t app F; wait_s 4
+liveliest favorites
+python3 "$RENDER" "$OUT/favorites.png" "$ENV/ans/favorites.ans" --title "driftwave — favorites"
+fi
+
+if want output; then
+echo "audio output"
+run "'#synthwave'"
+play_first_ok
+tm send-keys -t app O; wait_s 3
+# Only move the cursor to the virtual microphone: choosing it would create
+# real devices and, with "hear it too", play on the speakers.
+for _ in $(seq 1 12); do tm send-keys -t app Down; done
+wait_s 0.5
+liveliest output
+python3 "$RENDER" "$OUT/output.png" "$ENV/ans/output.ans" --title "driftwave — audio output"
+fi
 
 echo "done: $(ls "$OUT")"

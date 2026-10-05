@@ -1101,7 +1101,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             ("←→", "seek"),
             ("l", "lyrics"),
             ("e", "enqueue"),
-            ("u", "up next"),
+            ("f/F", "favorites"),
             ("q", "quit"),
             ("?", "all keys"),
         ]
