@@ -53,6 +53,11 @@
     <category>Player</category>
   </categories>
   <releases>
+    <release version="0.1.4" date="2026-10-05">
+      <description>
+        <p>The virtual microphone is now a switch on top of the output device you chose, so the music reaches Discord or a softphone while you keep hearing it on your own speakers or headset. Favorites are in the key legend at the bottom.</p>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-10-05">
       <description>
         <p>Favorites: press f to keep a track, F to see them all. Choose where the music plays: any sound card, or a virtual microphone that carries it into Discord, a softphone or any other app.</p>
