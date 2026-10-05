@@ -10,6 +10,7 @@ mod lyrics;
 mod lyrics_window;
 mod mpris;
 mod notify;
+mod output;
 mod player;
 mod queue;
 mod settings;

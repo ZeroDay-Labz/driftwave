@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -12,6 +13,7 @@ use crate::lyrics::Lyrics;
 use crate::app::{App, Mode, ViewKind};
 use crate::settings::{FIELDS, Value};
 use crate::lyrics::LyricsState;
+use crate::output::{Output, Row};
 use crate::queue::Repeat;
 
 const ORANGE: Color = Color::Rgb(255, 85, 0);
@@ -106,6 +108,7 @@ const KEYS: &[(&str, &str)] = &[
     ("e  E", "add to queue / play next"),
     ("u", "show the queue (⏎ jump, d remove)"),
     ("h", "recently played"),
+    ("f  F", "favorite the track / show favorites"),
     ("x  r  R", "shuffle / repeat / radio"),
     ("l  L", "lyrics / pop lyrics out to a window"),
     ("[  ]  / right-click", "lyrics timing: nudge / \"this line is now\""),
@@ -113,6 +116,7 @@ const KEYS: &[(&str, &str)] = &[
     ("o", "search the song on Genius"),
     ("D", "official download (if the uploader allows)"),
     (",  F2", "settings / library folder"),
+    ("O", "audio output: device, or a virtual mic for other apps"),
     ("q", "quit"),
 ];
 
@@ -226,10 +230,15 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = panel(Line::from(title), app.mode == Mode::Normal);
     app.hits.list = block.inner(area);
 
-    if app.views.last().is_some_and(|v| v.kind == ViewKind::Settings) {
-        draw_settings(frame, app, block, area);
+    if let Some(v) = app.views.last().filter(|v| v.kind == ViewKind::Settings) {
+        if v.tab == 1 {
+            draw_audio(frame, app, block, area);
+        } else {
+            draw_settings(frame, app, block, area);
+        }
         return;
     }
+    let favorites: HashSet<u64> = app.state.favorites.iter().map(|t| t.id).collect();
     let playing_id = app.now_playing().map(|t| t.id);
     let paused = app.player.is_paused();
     let frame_no = app.frame;
@@ -274,7 +283,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         Span::raw(format!("{:>3} ", i + 1)).fg(FAINT)
                     };
-                    let (line, genre) = track_row(t, marker, inner_width);
+                    let (line, genre) = track_row(t, marker, favorites.contains(&t.id), inner_width);
                     if let (Some((from_right, w)), Some(g)) = (genre, &t.genre) {
                         genres.push((i, g.trim().to_string(), from_right, w));
                     }
@@ -397,9 +406,99 @@ fn row<'a>(mut left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<
     Line::from(left)
 }
 
+/// The Settings screen's Audio tab: where the music plays.
+fn draw_audio(frame: &mut Frame, app: &mut App, block: Block, area: Rect) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let snap = match &app.outputs {
+        Some(Ok(snap)) => snap,
+        other => {
+            let msg = match other {
+                Some(Err(e)) => Line::from(e.clone()).fg(PINK),
+                _ => Line::from(format!("{} Looking for devices…", SPINNER[(app.frame / 2) as usize % SPINNER.len()])).fg(AMBER),
+            };
+            let at = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(1) };
+            frame.render_widget(Paragraph::new(msg).wrap(Wrap { trim: true }), at);
+            return;
+        }
+    };
+    let st = &app.state;
+    let list = crate::output::rows(snap, &st.output);
+    let rows = Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: (list.len() as u16).min(inner.height.saturating_sub(1)) };
+    app.hits.settings_rows = rows;
+    let choice = |on: bool, label: String| {
+        let dot = if on { Span::raw("● ").fg(LIME).bold() } else { Span::raw("○ ").fg(MUTED) };
+        vec![dot, Span::raw(label).fg(if on { TEXT } else { MUTED })]
+    };
+    let option = |on: bool, label: &str| {
+        let value = if on { Span::raw("● on").fg(LIME).bold() } else { Span::raw("○ off").fg(MUTED) };
+        vec![Span::raw(format!("    {:<30} ", truncate(label, 30))).fg(TEXT), value]
+    };
+    for (i, row) in list.iter().enumerate().take(rows.height as usize) {
+        let selected = i == app.audio_sel;
+        let mut spans = vec![if selected { Span::raw("▌ ").fg(ORANGE) } else { Span::raw("  ") }];
+        spans.extend(match *row {
+            Row::Heading(text) => vec![Span::raw(text).fg(AMBER)],
+            Row::Note(text) => vec![Span::raw(format!("    {text}")).fg(FAINT)],
+            Row::Default => choice(
+                st.output == Output::Default,
+                format!("System default ({})", snap.description(&snap.default_sink)),
+            ),
+            Row::Device(n) => {
+                let sink = &snap.sinks[n];
+                choice(matches!(&st.output, Output::Device(name) if *name == sink.name), sink.description.clone())
+            }
+            Row::Missing => {
+                let name = if let Output::Device(name) = &st.output { name.as_str() } else { "" };
+                choice(true, format!("{name} (not connected: using the system default)"))
+            }
+            Row::VirtualMic => choice(
+                st.output == Output::VirtualMic,
+                "Virtual microphone → other apps (Discord, softphones…)".into(),
+            ),
+            Row::HearToo => option(st.hear_too, "Hear it on my speakers too"),
+            Row::MixMic => option(st.mix_mic, "Mix in my microphone"),
+            Row::App(n) => option(snap.recorders[n].sent, &snap.recorders[n].app),
+        });
+        let mut line = Line::from(spans);
+        if selected {
+            line = line.bg(SELECTED_BG);
+        }
+        frame.render_widget(line, Rect { y: rows.y + i as u16, height: 1, ..inner });
+    }
+
+    let help_y = rows.bottom() + 1;
+    if help_y < inner.bottom() {
+        let text = match list.get(app.audio_sel) {
+            Some(Row::VirtualMic) => {
+                "Creates an input device called \"driftwave\" that carries the music. Choose it as the \
+                 microphone in Discord, a softphone or any other app. It disappears when driftwave quits."
+            }
+            Some(Row::HearToo) => "Also play the music on the system's default output, so you hear what the others hear.",
+            Some(Row::MixMic) => {
+                "Add your real (default) microphone to the virtual one, so the others hear you and the music."
+            }
+            Some(Row::App(_)) => {
+                "Switch this app's recording over to the virtual microphone right now, without touching \
+                 its settings. Turning it off (or quitting) puts its own microphone back."
+            }
+            Some(Row::Missing) => "Plug the device back in and it is used again the next time driftwave starts.",
+            _ => "Switches right away, and is remembered. Volume and everything else work as before.",
+        };
+        let help = Paragraph::new(vec![
+            Line::from(text).fg(MUTED),
+            Line::raw(""),
+            Line::from("⏎ / double-click to choose · tab for the other settings · esc back").fg(FAINT),
+        ])
+        .wrap(Wrap { trim: true });
+        let area = Rect { x: inner.x + 2, y: help_y, width: inner.width.saturating_sub(4), height: inner.bottom() - help_y };
+        frame.render_widget(help, area);
+    }
+}
+
 /// A track's row, plus where its genre label sits: (cells from the row's
 /// right edge to the label's start, label width), for click-to-open-genre.
-fn track_row(t: &Track, marker: Span<'static>, width: usize) -> (Line<'static>, Option<(usize, usize)>) {
+fn track_row(t: &Track, marker: Span<'static>, fav: bool, width: usize) -> (Line<'static>, Option<(usize, usize)>) {
     let mut title = Span::raw(t.title.clone()).fg(TEXT);
     if t.is_drm_only() {
         title = title.fg(MUTED);
@@ -417,6 +516,9 @@ fn track_row(t: &Track, marker: Span<'static>, width: usize) -> (Line<'static>, 
     }
     if t.can_download() {
         right.push(Span::raw("⤓ ").fg(LIME));
+    }
+    if fav {
+        right.push(Span::raw("♥ ").fg(PINK));
     }
     let genre_at = right.len();
     let has_genre = t.genre.as_deref().is_some_and(|g| !g.trim().is_empty());
@@ -500,6 +602,12 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(t.user.username.clone()).fg(SKY),
                 Span::raw(" "),
             ];
+            if app.state.is_favorite(t.id) {
+                spans.push(Span::raw("♥ ").fg(PINK));
+            }
+            if let Some(to) = app.output_label() {
+                spans.push(Span::raw(format!("→ {} ", truncate(&to, 24))).fg(VIOLET));
+            }
             if let Some(q) = app.quality {
                 spans.push(Span::raw(format!(" {q} ")).fg(Color::Black).bg(if q.starts_with("AAC") {
                     LIME

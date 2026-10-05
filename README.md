@@ -30,6 +30,9 @@
 - **Plays around DRM**: label tracks SoundCloud only streams encrypted are marked `DRM`, and
   driftwave plays another upload of the same song instead (often the label's own account)
 - **Queue, shuffle, repeat, and endless radio** (keeps playing related tracks)
+- **Favorites**: press `f` to keep a track, `F` to see them all
+- **Choose where it plays**: any sound card, or a **virtual microphone** that carries the music
+  into Discord, a softphone or any other app
 - **Live spectrum visualizer** and small album art (kitty/sixel graphics, block fallback elsewhere)
 - **Lyrics that follow the song**: synced lyrics from [LRCLIB](https://lrclib.net), Genius as a
   fallback, in the app or a **pop-out window**. Click a line to jump there, fix the timing with a
@@ -39,7 +42,7 @@
 - **Media keys, headset buttons, KDE/GNOME media widgets** (MPRIS) and track notifications
 - **Mouse everywhere**: click, double-click, right-click, scroll, drag to seek
 - **Always shows its keys**: a key legend at the bottom, and every button shows its shortcut
-- Remembers your volume, modes, history and lyrics timing fixes
+- Remembers your volume, modes, history, favorites, output and lyrics timing fixes
 
 <p align="center">
   <img src="docs/screenshots/genre.png" alt="Browsing the #nerdcore genre" width="49%">
@@ -91,12 +94,14 @@ The bottom line always shows the main keys, and `?` lists them all. The buttons 
 | `u` | show the queue (`⏎` jump, `d` remove) |
 | `x` / `r` / `R` | shuffle / repeat / radio |
 | `h` | recently played |
+| `f` / `F` | favorite the track (marked `♥`) / show your favorites |
 | `l` / `L` | lyrics / pop lyrics out into their own window |
 | `[` / `]` | lyrics timing 0.5 s earlier / later |
 | `c` | copy the lyrics |
 | `o` | search the song on Genius in your browser |
 | `D` | official download |
 | `,` | settings |
+| `O` | audio output |
 | `q` | quit |
 
 ## Genres and tags
@@ -171,6 +176,25 @@ Drop your own `Artist - Title.lrc` into `Lyrics/` and driftwave uses it instead 
 (marked `⤓`), and need your SoundCloud session: sign in at soundcloud.com, open DevTools →
 Storage → Cookies, copy `oauth_token`, and paste it in Settings. It's stored privately (0600) in
 `~/.config/driftwave/state.json` and only sent to SoundCloud.
+
+## Audio output
+
+Press `O` (or open Settings and switch to the **Audio** tab) to choose where the music plays.
+It switches right away, mid-song, and is remembered.
+
+- **System default** or any **sound card**: headset, speakers, HDMI…
+- **Virtual microphone**: creates an input device called `driftwave` that carries the music.
+  Pick it as the microphone in Discord, a softphone or any other app, and the people there
+  hear what you play.
+  - *Hear it on my speakers too* keeps the music audible for you as well.
+  - *Mix in my microphone* adds your real microphone, so they hear you and the music.
+  - *Send to an app that is recording now* lists apps that are in a call and switches one over
+    without touching its settings. Turning it off, or quitting driftwave, puts its own
+    microphone back.
+
+The virtual microphone exists only while driftwave runs. This needs PipeWire or PulseAudio and
+the `pactl` command (part of `pipewire-pulse` / `pulseaudio-utils`); without it driftwave plays
+on the default device as before.
 
 ### Lyrics window placement (KDE)
 

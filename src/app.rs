@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,6 +10,7 @@ use crate::lyrics::{self, LyricsState};
 use crate::lyrics_window;
 use crate::mpris::{self, Mpris, SeekDirection};
 use crate::notify::Notifier;
+use crate::output::{self, Output, Row};
 use crate::{player, ui};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -37,6 +38,9 @@ pub enum Reply {
     Downloaded(Result<std::path::PathBuf>),
     /// Another upload to play instead of a DRM-only track.
     Alternative { generation: u64, original: Box<Track>, result: Result<Option<Box<Track>>> },
+    /// The sound server's devices, after `changed` something (or just a look).
+    /// `applied`: that change was the user's choice of output.
+    Outputs { changed: bool, applied: bool, result: Result<(output::Snapshot, Option<String>)> },
 }
 
 /// An official download in progress.
@@ -45,6 +49,9 @@ struct Download {
     done: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
 }
+
+/// How often to look for our audio stream before giving up (twice a second).
+const OUTPUT_TRIES: u8 = 20;
 
 pub struct Tab {
     pub name: &'static str,
@@ -136,6 +143,23 @@ pub struct App {
     pub settings_sel: usize,
     pub settings_edit: Option<String>,
     download: Option<Download>,
+    /// Selected row on the Settings screen's Audio tab.
+    pub audio_sel: usize,
+    /// Devices and recording apps, as last seen (None until first asked).
+    pub outputs: Option<Result<output::Snapshot, String>>,
+    /// Virtual devices we created; dropping it removes them.
+    routing: Arc<Mutex<output::Routing>>,
+    /// A `pactl` round trip is running.
+    output_busy: bool,
+    /// The chosen output still has to be applied, not before `output_next`
+    /// (our stream takes a moment to show up), giving up after some tries.
+    output_wanted: bool,
+    output_tries: u8,
+    output_next: Instant,
+    /// A recording app to point at the virtual microphone (or back).
+    output_send: Option<(u32, bool)>,
+    /// When `outputs` was last refreshed.
+    outputs_at: Instant,
     /// Link to pop-out lyrics windows, started the first time one is opened.
     ipc: Option<ipc::Server>,
     /// (track id, lyrics status, timing corrections) last sent to the window.
@@ -173,6 +197,7 @@ impl App {
         player.set_volume(state.volume());
         let mut queue = Queue::default();
         (queue.shuffle, queue.repeat, queue.radio) = (state.shuffle, state.repeat, state.radio);
+        thread::spawn(output::sweep_stale);
             App {
             mode: Mode::Search,
             input: query,
@@ -199,6 +224,16 @@ impl App {
             settings_sel: 0,
             settings_edit: None,
             download: None,
+            audio_sel: 1,
+            outputs: None,
+            routing: Default::default(),
+            output_busy: false,
+            // Left alone unless the user chose something.
+            output_wanted: state.output != Output::Default,
+            output_tries: OUTPUT_TRIES,
+            output_next: Instant::now(),
+            output_send: None,
+            outputs_at: Instant::now(),
             ipc: None,
             ipc_sent: None,
             ipc_pos_at: Instant::now(),
@@ -317,6 +352,43 @@ impl App {
         let ids: Vec<u64> = self.state.history.iter().map(|t| t.id).collect();
         let v = self.push_view("Recently played".into(), &["History"]);
         self.load(v, 0, move |sc| sc.tracks_by_ids(&ids), Item::Track);
+    }
+
+    /// The user's favorites. Fresh copies come from the API so they're
+    /// playable; one SoundCloud no longer returns is kept as it was saved.
+    fn open_favorites(&mut self) {
+        if self.state.favorites.is_empty() {
+            self.status = "No favorites yet: press f on a track to keep it".into();
+            return;
+        }
+        let saved = self.state.favorites.clone();
+        let v = self.push_view("Favorites".into(), &["Favorites"]);
+        self.load(
+            v,
+            0,
+            move |sc| {
+                let ids: Vec<u64> = saved.iter().map(|t| t.id).collect();
+                let mut fresh: HashMap<u64, Track> =
+                    sc.tracks_by_ids(&ids).unwrap_or_default().into_iter().map(|t| (t.id, t)).collect();
+                Ok(saved.into_iter().map(|t| fresh.remove(&t.id).unwrap_or(t)).collect())
+            },
+            Item::Track,
+        );
+    }
+
+    /// Keep or drop the selected track (or the one playing).
+    fn toggle_favorite(&mut self) {
+        let track = match self.views.last().and_then(View::selected) {
+            Some(Item::Track(t)) => Some(t.clone()),
+            _ => self.now_playing().cloned(),
+        };
+        let Some(track) = track else { return };
+        self.status = if self.state.toggle_favorite(&track) {
+            format!("♥ Added {} to favorites", track.title)
+        } else {
+            format!("Removed {} from favorites", track.title)
+        };
+        self.state_dirty = true;
     }
 
     /// A genre/tag page: top and newest tracks, its artists, playlists, and
@@ -708,10 +780,157 @@ impl App {
         if self.views.last().is_some_and(|v| v.kind == ViewKind::Settings) {
             return;
         }
-        self.push_view("Settings".into(), &["Settings"]);
+        self.push_view("Settings".into(), &["Settings", "Audio"]);
         let v = self.views.last_mut().unwrap();
         v.kind = ViewKind::Settings;
         v.tabs[0].loading = false;
+    }
+
+    /// Settings, on the Audio tab.
+    fn open_audio(&mut self) {
+        self.open_settings();
+        if let Some(v) = self.views.last_mut() {
+            v.tab = 1;
+        }
+    }
+
+    fn on_audio_tab(&self) -> bool {
+        self.views.last().is_some_and(|v| v.kind == ViewKind::Settings && v.tab == 1)
+    }
+
+    /// The Audio tab's rows right now.
+    pub fn audio_rows(&self) -> Vec<Row> {
+        match &self.outputs {
+            Some(Ok(snap)) => output::rows(snap, &self.state.output),
+            _ => Vec::new(),
+        }
+    }
+
+    fn move_audio_sel(&mut self, down: bool) {
+        let rows = self.audio_rows();
+        let mut i = self.audio_sel;
+        loop {
+            i = if down { i + 1 } else { i.wrapping_sub(1) };
+            match rows.get(i) {
+                Some(r) if r.selectable() => break self.audio_sel = i,
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+
+    /// Enter on an Audio row: choose that output, or flip the option.
+    fn activate_audio_row(&mut self) {
+        let Some(Ok(snap)) = &self.outputs else { return };
+        let Some(&row) = output::rows(snap, &self.state.output).get(self.audio_sel) else { return };
+        match row {
+            Row::Default => self.state.output = Output::Default,
+            Row::Device(i) => self.state.output = Output::Device(snap.sinks[i].name.clone()),
+            Row::VirtualMic => self.state.output = Output::VirtualMic,
+            Row::HearToo => self.state.hear_too = !self.state.hear_too,
+            Row::MixMic => self.state.mix_mic = !self.state.mix_mic,
+            Row::App(i) => {
+                let r = &snap.recorders[i];
+                self.output_send = Some((r.index, !r.sent));
+                return;
+            }
+            Row::Missing | Row::Heading(_) | Row::Note(_) => return,
+        }
+        self.state_dirty = true;
+        self.output_wanted = true;
+        self.output_tries = OUTPUT_TRIES;
+        self.output_next = Instant::now();
+    }
+
+    /// Where the music is going, when that isn't simply the default device.
+    pub fn output_label(&self) -> Option<String> {
+        match &self.state.output {
+            Output::Default => None,
+            Output::VirtualMic => Some("virtual mic".into()),
+            Output::Device(name) => Some(match &self.outputs {
+                Some(Ok(snap)) => snap.description(name).to_string(),
+                _ => name.clone(),
+            }),
+        }
+    }
+
+    /// Talk to the sound server when there's a reason to: a choice to
+    /// apply, an app to redirect, or the Audio tab needing a fresh list.
+    fn sync_outputs(&mut self) {
+        if self.output_busy {
+            return;
+        }
+        let now = Instant::now();
+        let mut applied = false;
+        let change = if let Some((recorder, on)) = self.output_send.take() {
+            Some(output::Change::Send { recorder, on })
+        } else if self.output_wanted && now >= self.output_next {
+            (self.output_wanted, applied) = (false, true);
+            Some(output::Change::Apply {
+                output: self.state.output.clone(),
+                hear_too: self.state.hear_too,
+                mix_mic: self.state.mix_mic,
+            })
+        } else if self.on_audio_tab() && (self.outputs.is_none() || now >= self.outputs_at + Duration::from_secs(2)) {
+            None
+        } else {
+            return;
+        };
+        self.output_busy = true;
+        let (tx, routing) = (self.tx.clone(), self.routing.clone());
+        let changed = change.is_some();
+        thread::spawn(move || {
+            let _ = tx.send(Reply::Outputs { changed, applied, result: output::sync(&routing, change) });
+        });
+    }
+
+    fn outputs_arrived(
+        &mut self,
+        changed: bool,
+        applying: bool,
+        result: Result<(output::Snapshot, Option<String>)>,
+    ) {
+        self.output_busy = false;
+        self.outputs_at = Instant::now();
+        match result {
+            Ok((snap, note)) => {
+                if applying && snap.our_input.is_none() {
+                    // Our stream hasn't registered yet: look again shortly.
+                    self.output_tries = self.output_tries.saturating_sub(1);
+                    if self.output_tries > 0 {
+                        self.output_wanted = true;
+                        self.output_next = Instant::now() + Duration::from_millis(500);
+                    } else {
+                        self.status = "Audio output: the sound server doesn't show driftwave's stream".into();
+                    }
+                } else if let Some(note) = note {
+                    self.status = note;
+                } else if applying {
+                    let to = match &self.state.output {
+                        Output::Default => format!("system default ({})", snap.description(&snap.default_sink)),
+                        Output::Device(name) => snap.description(name).to_string(),
+                        Output::VirtualMic => "virtual microphone (\"driftwave\" in other apps)".into(),
+                    };
+                    self.status = format!("Output: {to}");
+                }
+                self.outputs = Some(Ok(snap));
+                let rows = self.audio_rows();
+                if !rows.get(self.audio_sel).is_some_and(|r| r.selectable()) {
+                    // The list changed under the selection: nearest row above.
+                    let last = self.audio_sel.min(rows.len().saturating_sub(1));
+                    self.audio_sel = (0..=last).rev().find(|&i| rows[i].selectable()).unwrap_or(1);
+                }
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                if changed {
+                    self.status = format!("Audio output: {e}");
+                }
+                if !matches!(self.outputs, Some(Ok(_))) {
+                    self.outputs = Some(Err(e));
+                }
+            }
+        }
     }
 
     /// Enter on a Settings row: toggle, cycle, start editing, or run it.
@@ -1000,6 +1219,7 @@ impl App {
                 self.loading = false;
                 self.status = format!("Can't play this track: {e:#}");
             }
+            Reply::Outputs { changed, applied, result } => self.outputs_arrived(changed, applied, result),
             Reply::Alternative { generation, .. } if generation != self.generation => {}
             Reply::Alternative { original, result, .. } => match result {
                 Ok(Some(alt)) => {
@@ -1097,7 +1317,17 @@ impl App {
             }
         }
 
-        if self.views.last().is_some_and(|v| v.kind == ViewKind::Settings) {
+        if self.on_audio_tab() {
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_audio_sel(false),
+                KeyCode::Down | KeyCode::Char('j') => self.move_audio_sel(true),
+                KeyCode::Enter => self.activate_audio_row(),
+                _ => {}
+            }
+            if matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Char('j' | 'k')) {
+                return;
+            }
+        } else if self.views.last().is_some_and(|v| v.kind == ViewKind::Settings) {
             match code {
                 KeyCode::Up | KeyCode::Char('k') => self.settings_sel = self.settings_sel.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => self.settings_sel = (self.settings_sel + 1).min(FIELDS.len() - 1),
@@ -1151,6 +1381,9 @@ impl App {
             }
             KeyCode::Char('t') => self.open_selected_tag(),
             KeyCode::Char(',') | KeyCode::F(2) => self.open_settings(),
+            KeyCode::Char('O') => self.open_audio(),
+            KeyCode::Char('f') => self.toggle_favorite(),
+            KeyCode::Char('F') => self.open_favorites(),
             KeyCode::Char('D') => self.download_selected(),
             KeyCode::Char('d') => self.remove_from_queue(),
             KeyCode::Char('x') => self.toggle_shuffle(),
@@ -1278,14 +1511,26 @@ impl App {
             self.views.truncate(i + 1);
         } else if hits.settings_rows.contains(at) {
             let row = (at.y - hits.settings_rows.y) as usize;
-            if row < FIELDS.len() {
+            let audio = self.on_audio_tab();
+            let exists = if audio {
+                self.audio_rows().get(row).is_some_and(|r| r.selectable())
+            } else {
+                row < FIELDS.len()
+            };
+            if exists {
                 let now = Instant::now();
                 let double = matches!(self.last_click,
                     Some((t, i)) if i == row && now.duration_since(t) < Duration::from_millis(400));
                 self.last_click = if double { None } else { Some((now, row)) };
-                self.settings_sel = row;
-                if double {
-                    self.activate_setting();
+                if audio {
+                    self.audio_sel = row;
+                } else {
+                    self.settings_sel = row;
+                }
+                match (double, audio) {
+                    (true, true) => self.activate_audio_row(),
+                    (true, false) => self.activate_setting(),
+                    _ => {}
                 }
             }
         } else if let Some((_, genre)) = hits.genre_links.iter().find(|(r, _)| r.contains(at)) {
@@ -1367,6 +1612,7 @@ impl App {
         }
         self.refresh_queue_view();
         self.sync_state();
+        self.sync_outputs();
         self.sync_lyrics_window();
         self.sync_mpris();
         self.send_notification();

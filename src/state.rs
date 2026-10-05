@@ -41,6 +41,14 @@ pub struct State {
     pub lyrics_sync: std::collections::BTreeMap<u64, crate::lyrics::LyricSync>,
     /// Most recently played first.
     pub history: Vec<Track>,
+    /// Tracks the user keeps, most recently added first.
+    pub favorites: Vec<Track>,
+    /// Where the music plays (see `output`).
+    pub output: crate::output::Output,
+    /// With the virtual microphone: also play on the speakers, and mix the
+    /// real microphone in.
+    pub hear_too: bool,
+    pub mix_mic: bool,
 }
 
 impl Default for State {
@@ -61,6 +69,10 @@ impl Default for State {
             oauth_token: None,
             lyrics_sync: Default::default(),
             history: Vec::new(),
+            favorites: Vec::new(),
+            output: Default::default(),
+            hear_too: true,
+            mix_mic: false,
         }
     }
 }
@@ -127,6 +139,20 @@ impl State {
         self.history.insert(0, track.clone());
         self.history.truncate(HISTORY_LEN);
     }
+
+    pub fn is_favorite(&self, id: u64) -> bool {
+        self.favorites.iter().any(|t| t.id == id)
+    }
+
+    /// Add or remove a favorite; true if it is one now.
+    pub fn toggle_favorite(&mut self, track: &Track) -> bool {
+        let before = self.favorites.len();
+        self.favorites.retain(|t| t.id != track.id);
+        if self.favorites.len() == before {
+            self.favorites.insert(0, track.clone());
+        }
+        self.favorites.len() > before
+    }
 }
 
 #[cfg(test)]
@@ -147,15 +173,22 @@ mod tests {
         }
         let ids: Vec<u64> = s.history.iter().map(|t| t.id).collect();
         assert_eq!(ids, [3, 1, 2], "newest first, no duplicates");
+        assert!(s.toggle_favorite(&track(5)) && s.toggle_favorite(&track(6)));
+        assert!(!s.toggle_favorite(&track(5)), "a second time removes it");
+        assert!(s.toggle_favorite(&track(7)) && s.is_favorite(6) && !s.is_favorite(5));
+        s.output = crate::output::Output::VirtualMic;
 
         let back: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.volume(), 0.4);
         assert_eq!(back.repeat, Repeat::One);
         assert_eq!(back.history.len(), 3);
+        assert_eq!(back.favorites.iter().map(|t| t.id).collect::<Vec<_>>(), [7, 6], "newest first");
+        assert_eq!(back.output, crate::output::Output::VirtualMic);
 
         // Older/partial files still load, with defaults for missing fields.
         let mut partial: State = serde_json::from_str(r#"{"volume": 0.1}"#).unwrap();
         assert!(partial.notifications && partial.history.is_empty());
+        assert!(partial.favorites.is_empty() && partial.hear_too && partial.output == Default::default());
         // An old linear volume carries over at the same loudness.
         partial.migrate();
         assert!((partial.volume() - 0.464).abs() < 0.001);
