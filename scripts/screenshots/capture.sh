@@ -4,7 +4,7 @@
 # PipeWire sink, and each screen is rendered to PNG by render.py.
 #
 #   scripts/screenshots/capture.sh              # all of them
-#   scripts/screenshots/capture.sh favorites    # only these: player genre lyrics favorites output
+#   scripts/screenshots/capture.sh favorites    # only these: player welcome genre lyrics favorites output
 #
 # Needs: tmux, pactl (PipeWire/PulseAudio), python3 + Pillow, and a built
 # target/release/driftwave (it builds one if missing).
@@ -62,7 +62,7 @@ play_first_ok() {  # start the first result that isn't DRM/preview, wait until i
     local first; first=$(screen | grep -nE '^│. +[0-9]+ ' | head -1 | cut -d: -f1)
     for _ in $(seq $((rows - first))); do tm send-keys -t app Down; done
     tm send-keys -t app Enter
-    for _ in $(seq 1 100); do screen | grep -qE 'AAC 160k|MP3 128k' && break; wait_s 0.1; done
+    for _ in $(seq 1 100); do screen | grep -qE 'AAC 160k|AAC 96k|MP3 128k|MP3 preview' && break; wait_s 0.1; done
 }
 liveliest() {  # capture a few frames, keep the one with the most visualizer bars
     local best=0 n
@@ -83,6 +83,14 @@ liveliest player
 python3 "$RENDER" "$OUT/player.png" "$ENV/ans/player.ans" --title "driftwave"
 fi
 
+if want welcome; then
+echo "welcome screen"
+run
+tm send-keys -t app Escape; wait_s 0.5
+grab app welcome
+python3 "$RENDER" "$OUT/welcome.png" "$ENV/ans/welcome.ans" --title "driftwave"
+fi
+
 if want genre; then
 echo "genre page"
 run "'#nerdcore'"
@@ -100,7 +108,7 @@ echo "synced lyrics"
 # the label's playable upload.
 run aesop rock rings
 tm send-keys -t app Enter
-for _ in $(seq 1 150); do screen | grep -qE 'AAC 160k|MP3 128k' && break; wait_s 0.1; done
+for _ in $(seq 1 150); do screen | grep -qE 'AAC 160k|AAC 96k|MP3 128k|MP3 preview' && break; wait_s 0.1; done
 for _ in 1 2 3 4 5 6; do tm send-keys -t app Right; done
 wait_s 3
 tm send-keys -t app l; wait_s 2

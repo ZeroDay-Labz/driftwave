@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::hls::{self, Segments};
 use crate::library;
+use crate::links::{self, Link};
 use crate::stream::StreamBuffer;
 
 const API: &str = "https://api-v2.soundcloud.com";
@@ -55,6 +56,9 @@ pub struct Track {
     pub has_downloads_left: Option<bool>,
     #[serde(default)]
     publisher_metadata: Option<PublisherMetadata>,
+    /// The track's soundcloud.com page, for sharing.
+    #[serde(default)]
+    pub permalink_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -77,6 +81,8 @@ pub struct User {
     pub verified: Option<bool>,
     #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub permalink_url: Option<String>,
 }
 
 /// An album, EP, single or user playlist ("set").
@@ -98,6 +104,8 @@ pub struct Playlist {
     pub release_date: Option<String>,
     #[serde(default)]
     pub display_date: Option<String>,
+    #[serde(default)]
+    pub permalink_url: Option<String>,
     /// Only the first few entries are full tracks; the rest are `{id}` stubs.
     #[serde(default)]
     tracks: Vec<Value>,
@@ -144,6 +152,13 @@ pub struct Transcoding {
     pub snipped: bool,
 }
 
+impl Transcoding {
+    /// Unencrypted, so we can decode it.
+    fn is_plain(&self) -> bool {
+        matches!(self.format.protocol.as_str(), "hls" | "progressive")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Format {
     pub protocol: String,
@@ -157,9 +172,10 @@ impl Track {
     }
 
     /// SoundCloud only streams this track DRM-encrypted (typical for label
-    /// releases): the plain MP3 it lists doesn't exist, so we can't play it.
+    /// releases), so we can't play it.
     pub fn is_drm_only(&self) -> bool {
-        self.media.transcodings.iter().any(|x| x.format.protocol.contains("encrypted"))
+        let t = &self.media.transcodings;
+        t.iter().any(|x| x.format.protocol.contains("encrypted")) && !t.iter().any(Transcoding::is_plain)
     }
 
     /// The uploader offers an official download.
@@ -199,6 +215,63 @@ impl OpenStream {
             StreamSource::Mp3(b) => b.cancel(),
         }
     }
+}
+
+/// SoundCloud answered with an error status. Its message never includes the
+/// URL: those carry the client id and signed stream tokens.
+#[derive(Debug)]
+pub struct HttpStatus(pub StatusCode);
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = self.0.as_u16();
+        match code {
+            401 | 403 => write!(f, "SoundCloud refused the request ({code})"),
+            404 => write!(f, "SoundCloud says it doesn't exist (404)"),
+            429 => write!(f, "SoundCloud is rate-limiting us (429); try again in a minute"),
+            500..=599 => write!(f, "SoundCloud is having trouble ({code})"),
+            _ => write!(f, "SoundCloud returned {code}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// GET a URL outside api-v2 (stream playlists, segments), with errors that
+/// don't leak the signed URL.
+fn fetch(http: &Client, url: &str) -> Result<reqwest::blocking::Response> {
+    let resp = http.get(url).send().map_err(reqwest::Error::without_url)?;
+    match resp.status() {
+        s if s.is_success() => Ok(resp),
+        s => Err(HttpStatus(s).into()),
+    }
+}
+
+/// A short, human explanation of an error for the status line: no URLs,
+/// no tokens, no reqwest internals.
+pub fn friendly_error(e: &anyhow::Error) -> String {
+    for cause in e.chain() {
+        if let Some(s) = cause.downcast_ref::<HttpStatus>() {
+            return s.to_string();
+        }
+        if let Some(r) = cause.downcast_ref::<reqwest::Error>() {
+            if r.is_timeout() {
+                return "SoundCloud took too long to answer (network timeout)".into();
+            }
+            if r.is_connect() || r.is_request() {
+                return "can't reach SoundCloud (network problem?)".into();
+            }
+        }
+    }
+    let url = Regex::new(r"\(?(?:https?://|for url)\S*\)?").unwrap();
+    let text = url.replace_all(&format!("{e:#}"), "").to_string();
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_auth_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<HttpStatus>().is_some_and(|s| matches!(s.0.as_u16(), 401 | 403 | 404))
+    })
 }
 
 #[derive(Deserialize)]
@@ -434,8 +507,15 @@ impl SoundCloud {
 
     /// Resolve a soundcloud.com / on.soundcloud.com URL to a track, artist
     /// or playlist.
-    pub fn resolve(&self, url: &str) -> Result<Item> {
-        let body = self.get_api(&format!("{API}/resolve"), &[("url", url)])?;
+    pub fn resolve(&self, link: &Link) -> Result<Item> {
+        let url = if link.is_short() {
+            // Short links redirect to the real page (with tracking params).
+            let real = fetch(&self.http, &link.url)?.url().to_string();
+            links::parse(&real).map(|l| l.url).unwrap_or(real)
+        } else {
+            link.url.clone()
+        };
+        let body = self.get_api(&format!("{API}/resolve"), &[("url", url.as_str())])?;
         let v: Value = serde_json::from_str(&body)?;
         Ok(match v.get("kind").and_then(Value::as_str) {
             Some("track") => Item::Track(serde_json::from_value(v)?),
@@ -488,36 +568,54 @@ impl SoundCloud {
     }
 
     /// Start streaming the track in the best quality we can get without a
-    /// Go+ subscription: unencrypted AAC 160k if offered, else MP3 128k.
+    /// Go+ subscription: unencrypted AAC 160k, else AAC 96k (all SoundCloud
+    /// offers for many monetized tracks), else the MP3 a Go+ preview has.
     /// Returns as soon as the first request succeeds; downloading continues
     /// in the background.
     pub fn open_stream(&self, track: &Track) -> Result<OpenStream> {
-        let t = &track.media.transcodings;
-        let find = |preset: &str, protocol: &str| {
-            t.iter().find(|x| {
-                x.preset.as_deref() == Some(preset) && x.format.protocol == protocol && !x.snipped
-            })
-        };
-
-        // AAC on monetized tracks is only offered DRM-encrypted
-        // (cbc/ctr-encrypted-hls); those fall through to MP3.
-        if let Some(aac) = find("aac_160k", "hls")
-            && let Ok(segments) = self.stream_url(track, aac).and_then(|u| {
-                let playlist = self.http.get(&u).send()?.error_for_status()?.text()?;
-                Segments::start(&self.http, hls::parse_playlist(&playlist)?)
-            })
-        {
-            return Ok(OpenStream { source: StreamSource::Aac(segments), label: "AAC 160k" });
+        match self.open_stream_once(track) {
+            // The track's `track_authorization` goes stale after a while (a
+            // track that sat in the queue, history or favorites): fetch a
+            // fresh copy of it and try once more.
+            Err(e) if is_auth_error(&e) => match self.tracks_by_ids(&[track.id])?.into_iter().next() {
+                Some(fresh) => self.open_stream_once(&fresh),
+                None => Err(e),
+            },
+            other => other,
         }
+    }
 
-        let has_drm = t.iter().any(|x| x.format.protocol.contains("encrypted"));
-        self.open_mp3(track).map_err(|e| {
-            if has_drm {
-                anyhow!("DRM-protected label track, no unencrypted stream")
-            } else {
-                e
+    fn open_stream_once(&self, track: &Track) -> Result<OpenStream> {
+        let t = &track.media.transcodings;
+        let mut last_error = None;
+        for (preset, label) in [("aac_160k", "AAC 160k"), ("aac_96k", "AAC 96k")] {
+            let Some(tc) = t.iter().find(|x| {
+                x.preset.as_deref() == Some(preset) && x.format.protocol == "hls" && !x.snipped
+            }) else {
+                continue;
+            };
+            let opened = self.stream_url(track, tc).and_then(|u| {
+                let playlist = fetch(&self.http, &u)?.text()?;
+                Segments::start(&self.http, hls::parse_playlist(&playlist)?)
+            });
+            match opened {
+                Ok(segments) => return Ok(OpenStream { source: StreamSource::Aac(segments), label }),
+                Err(e) => last_error = Some(e),
             }
-        })
+        }
+        if t.iter().any(|x| x.format.mime_type == "audio/mpeg" && x.is_plain()) {
+            match self.open_mp3(track) {
+                Ok(s) => return Ok(s),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(e);
+        }
+        if t.iter().any(|x| x.format.protocol.contains("encrypted")) {
+            bail!("DRM-protected label track, no unencrypted stream");
+        }
+        bail!("SoundCloud offers no playable stream for this track")
     }
 
     fn open_mp3(&self, track: &Track) -> Result<OpenStream> {
@@ -536,7 +634,7 @@ impl SoundCloud {
         let media_url = self.stream_url(track, mp3)?;
 
         let buffer = if mp3.format.protocol == "progressive" {
-            let mut resp = self.http.get(&media_url).send()?.error_for_status()?;
+            let mut resp = fetch(&self.http, &media_url)?;
             let buffer = StreamBuffer::new(resp.content_length());
             let b = buffer.clone();
             std::thread::spawn(move || {
@@ -554,7 +652,7 @@ impl SoundCloud {
             buffer
         } else {
             // Rare fallback: MP3 segments are raw frames, so concatenate them.
-            let playlist = self.http.get(&media_url).send()?.error_for_status()?.text()?;
+            let playlist = fetch(&self.http, &media_url)?.text()?;
             let buffer = StreamBuffer::new(None);
             let (b, http) = (buffer.clone(), self.http.clone());
             std::thread::spawn(move || {
@@ -563,14 +661,15 @@ impl SoundCloud {
                     match http.get(url).send().and_then(|r| r.error_for_status()?.bytes()) {
                         Ok(bytes) if b.append(&bytes) => {}
                         Ok(_) => break,
-                        Err(e) => return b.finish(Some(e.to_string())),
+                        Err(e) => return b.finish(Some(e.without_url().to_string())),
                     }
                 }
                 b.finish(None);
             });
             buffer
         };
-        Ok(OpenStream { source: StreamSource::Mp3(buffer), label: "MP3 128k" })
+        let label = if mp3.snipped { "MP3 preview" } else { "MP3 128k" };
+        Ok(OpenStream { source: StreamSource::Mp3(buffer), label })
     }
 
     /// Exchange a transcoding's API URL for the actual (signed) media URL.
@@ -589,11 +688,12 @@ impl SoundCloud {
                 .get(url)
                 .query(params)
                 .query(&[("client_id", id.as_str())])
-                .send()?;
+                .send()
+                .map_err(reqwest::Error::without_url)?;
             match resp.status() {
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if attempt == 0 => continue,
-                s if !s.is_success() => bail!("SoundCloud returned {s} for {url}"),
-                _ => return Ok(resp.text()?),
+                s if !s.is_success() => return Err(HttpStatus(s).into()),
+                _ => return Ok(resp.text().map_err(reqwest::Error::without_url)?),
             }
         }
         unreachable!()
@@ -816,6 +916,69 @@ mod tests {
         let share = top.iter().filter(|t| tagged(t)).count() * 100 / top.len();
         println!("{share}% of top tracks carry the tag");
         assert!(share > 80);
+    }
+
+    /// Many monetized tracks only offer AAC 96k (no 160k, no MP3); they
+    /// used to fail with "no unencrypted stream available". Decodes ~0.5 s
+    /// into memory, plays nothing.
+    #[test]
+    #[ignore]
+    fn plays_aac_96k_only_tracks() {
+        let sc = SoundCloud::new().unwrap();
+        let only_96k = |t: &&Track| {
+            let has = |p: &str| t.media.transcodings.iter().any(|x| x.preset.as_deref() == Some(p) && x.format.protocol == "hls");
+            has("aac_96k") && !has("aac_160k")
+        };
+        let mut tried = 0;
+        for q in ["kpop", "drake", "taylor swift"] {
+            for t in sc.search_tracks(q).unwrap().iter().filter(only_96k).take(2) {
+                assert!(!t.is_drm_only());
+                let stream = sc.open_stream(t).unwrap_or_else(|e| panic!("{}: {e:#}", t.title));
+                assert_eq!(stream.label, "AAC 96k");
+                crate::player::prepare(stream).unwrap().cancel();
+                println!("ok: {}", t.title);
+                tried += 1;
+            }
+        }
+        assert!(tried > 0, "found no 96k-only tracks to test");
+    }
+
+    /// An expired `track_authorization` is replaced with a fresh one.
+    #[test]
+    #[ignore]
+    fn stale_authorization_is_refreshed() {
+        let sc = SoundCloud::new().unwrap();
+        let mut t = sc.search_tracks("lofi").unwrap().into_iter().find(|t| !t.is_drm_only() && !t.is_preview()).unwrap();
+        t.track_authorization = Some("expired".into());
+        sc.open_stream(&t).expect("refetched and streamed").cancel();
+    }
+
+    fn transcoding(preset: &str, protocol: &str) -> serde_json::Value {
+        serde_json::json!({"url": "u", "preset": preset, "format": {"protocol": protocol, "mime_type": "audio/mp4"}})
+    }
+
+    #[test]
+    fn drm_only_needs_every_stream_encrypted() {
+        let track = |tcs: Vec<serde_json::Value>| -> Track {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "title": "t", "duration": 1, "user": {"id": 1, "username": "u"}, "media": {"transcodings": tcs}
+            }))
+            .unwrap()
+        };
+        assert!(track(vec![transcoding("aac_160k", "cbc-encrypted-hls"), transcoding("aac_96k", "ctr-encrypted-hls")]).is_drm_only());
+        assert!(!track(vec![transcoding("aac_160k", "cbc-encrypted-hls"), transcoding("aac_96k", "hls")]).is_drm_only());
+        assert!(!track(vec![transcoding("aac_96k", "hls"), transcoding("abr_sq", "hls")]).is_drm_only());
+    }
+
+    #[test]
+    fn friendly_errors_hide_urls() {
+        let e: anyhow::Error = HttpStatus(StatusCode::FORBIDDEN).into();
+        assert_eq!(friendly_error(&e.context("opening stream")), "SoundCloud refused the request (403)");
+        let e = anyhow!("error decoding https://playback.example/x.m4s?Policy=abc&Signature=xyz (for url https://a/b)");
+        let msg = friendly_error(&e);
+        assert!(!msg.contains("http") && !msg.contains("Signature"), "{msg}");
+        assert!(is_auth_error(&HttpStatus(StatusCode::NOT_FOUND).into()));
+        assert!(!is_auth_error(&HttpStatus(StatusCode::TOO_MANY_REQUESTS).into()));
     }
 
     #[test]

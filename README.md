@@ -26,7 +26,10 @@
 - **Whole artist catalogs**: popular tracks, every upload, albums/EPs/singles, playlists
 - **Browse by genre or tag**: `#nerdcore`, `#folk punk`, `#hackercore`… with top and newest
   tracks, the genre's artists and playlists, and related tags to keep exploring
-- **Instant streaming** in AAC 160k, with the next track preloaded for gapless autoplay
+- **Instant streaming** in AAC 160k (or 96k when that's all SoundCloud offers), with the next
+  track preloaded for gapless autoplay
+- **Links in, links out**: paste a SoundCloud link anywhere to play it (short `on.soundcloud.com`
+  links, mobile and embed links too; `#t=1:23` starts there), and press `y` to copy a link to share
 - **Plays around DRM**: label tracks SoundCloud only streams encrypted are marked `DRM`, and
   driftwave plays another upload of the same song instead (often the label's own account)
 - **Queue, shuffle, repeat, and endless radio** (keeps playing related tracks)
@@ -52,6 +55,10 @@
 <p align="center">
   <img src="docs/screenshots/favorites.png" alt="The favorites list" width="49%">
   <img src="docs/screenshots/output.png" alt="Choosing the audio output, with the virtual microphone" width="49%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/welcome.png" alt="The welcome screen: search, genres, paste a link, share" width="49%">
 </p>
 
 ## Install
@@ -84,7 +91,9 @@ The bottom line always shows the main keys, and `?` lists them all. The buttons 
 
 | Key | Action |
 |---|---|
-| `/` | search (or paste a soundcloud.com link) |
+| `/` | search |
+| paste a link | play a soundcloud.com link (works anywhere, `#t=1:23` starts there) |
+| `y` / `Y` | copy the link to the selected track, artist or playlist / to the playing track at this moment (or click `⎘ share`) |
 | `⏎` / double-click | play / open artist or album |
 | `tab` / `1`–`4` | switch tabs |
 | `a` | go to the artist |
@@ -108,6 +117,24 @@ The bottom line always shows the main keys, and `?` lists them all. The buttons 
 | `,` | settings |
 | `O` | audio output |
 | `q` | quit |
+
+## Sharing and opening links
+
+Paste a SoundCloud link anywhere in driftwave, or pass it on the command line, and it plays:
+a track starts (at its `#t=` time if the link has one), an artist or playlist opens. Everything
+SoundCloud's Share button gives you works, including the "Listen to … on #SoundCloud" text:
+
+```
+https://soundcloud.com/artist/track?si=…&utm_source=clipboard   tracking bits are ignored
+https://on.soundcloud.com/AbC123                                short links
+https://m.soundcloud.com/artist/track                           mobile links
+https://soundcloud.com/artist/track/s-XyZ                       private (secret) links
+https://soundcloud.com/artist/track#t=1:23                      starts at 1:23
+https://w.soundcloud.com/player/?url=…                          embed codes
+```
+
+To share, press `y` on a track, artist, playlist or genre to copy its link, or `Y` (or click
+`⎘ share`) for the playing track at the current moment, so whoever opens it hears what you hear.
 
 ## Genres and tags
 
@@ -218,7 +245,7 @@ there.
 | `⤓` | the uploader allows downloads; press `D` to save it (needs your session, see above) |
 | `DRM` | SoundCloud only streams it encrypted; driftwave plays another upload instead |
 | `preview` | a SoundCloud Go+ track: driftwave plays a full upload of it if one exists, else a 30-second preview |
-| `AAC 160k` / `MP3 128k` | the quality of what's playing |
+| `AAC 160k` / `AAC 96k` / `MP3 preview` | the quality of what's playing (some tracks are only offered in 96k) |
 
 ## Troubleshooting
 

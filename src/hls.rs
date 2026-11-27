@@ -65,7 +65,12 @@ struct SlotState {
 impl Segments {
     /// Fetch the init segment, then start background workers for the rest.
     pub fn start(http: &Client, playlist: Playlist) -> Result<Arc<Self>> {
-        let init = http.get(&playlist.init).send()?.error_for_status()?.bytes()?.to_vec();
+        let init = http
+            .get(&playlist.init)
+            .send()
+            .and_then(|r| r.error_for_status()?.bytes())
+            .map_err(reqwest::Error::without_url)?
+            .to_vec();
         let n = playlist.segments.len();
         let (urls, durations): (Vec<_>, Vec<_>) = playlist.segments.into_iter().unzip();
         let seg = Arc::new(Segments {
@@ -108,7 +113,7 @@ impl Segments {
                 for attempt in 0..3 {
                     match http.get(&urls[i]).send().and_then(|r| r.error_for_status()?.bytes()) {
                         Ok(b) => return Ok(b.to_vec()),
-                        Err(e) => last = e.into(),
+                        Err(e) => last = e.without_url().into(),
                     }
                     thread::sleep(Duration::from_millis(200 * (attempt + 1)));
                 }

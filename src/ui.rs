@@ -26,6 +26,7 @@ const TEXT: Color = Color::Rgb(225, 225, 232);
 const MUTED: Color = Color::Rgb(115, 115, 130);
 const FAINT: Color = Color::Rgb(60, 60, 72);
 const SELECTED_BG: Color = Color::Rgb(48, 34, 52);
+const RED: Color = Color::Rgb(255, 85, 95);
 
 /// Where clickable things ended up on screen last frame, for mouse input.
 #[derive(Default)]
@@ -50,6 +51,10 @@ pub struct Hits {
     pub popout_button: Rect,
     pub popup_popout: Rect,
     pub genius_button: Rect,
+    /// "⎘ share": copies the playing track's link.
+    pub share_button: Rect,
+    /// The "up next" strip under the player: opens the queue.
+    pub up_next: Rect,
     pub shuffle_button: Rect,
     pub repeat_button: Rect,
     pub radio_button: Rect,
@@ -68,7 +73,12 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let now_height = (area.height / 3).clamp(7, 14);
+    // The player gets ~40% of the screen, but the list keeps at least 6 rows.
+    let now_height = if app.now_playing().is_none() {
+        6 // nothing to show yet: leave the room to the list
+    } else {
+        (area.height * 2 / 5).clamp(9, 16).min(area.height.saturating_sub(11).max(7))
+    };
     let [search_area, tabs_area, list_area, now_area, help_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(1),
@@ -94,7 +104,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 const KEYS: &[(&str, &str)] = &[
-    ("/  s", "search, or paste a soundcloud.com link"),
+    ("/  s", "search tracks, artists, albums, #genres"),
+    ("paste a link", "play a soundcloud.com link (#t=1:23 starts there)"),
+    ("y  Y / click ⎘", "copy link to share (Y: playing track, at this moment)"),
     ("⏎ / double-click", "play track, open artist / album"),
     ("tab  1-4", "switch tabs"),
     ("a", "go to the artist"),
@@ -227,7 +239,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         title.push(Span::raw(c.clone()).fg(if last { AMBER } else { MUTED }));
     }
     title.push(Span::raw(" "));
-    let block = panel(Line::from(title), app.mode == Mode::Normal);
+    let title = if crumbs.is_empty() { Line::default() } else { Line::from(title) };
+    let block = panel(title, app.mode == Mode::Normal);
     app.hits.list = block.inner(area);
 
     if let Some(v) = app.views.last().filter(|v| v.kind == ViewKind::Settings) {
@@ -243,13 +256,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let paused = app.player.is_paused();
     let frame_no = app.frame;
     let Some(view) = app.views.last_mut() else {
-        let hint = Paragraph::new(vec![
-            Line::raw(""),
-            Line::from("Search for an artist to browse all their tracks, albums and playlists.").fg(MUTED),
-        ])
-        .alignment(Alignment::Center)
-        .block(block);
-        frame.render_widget(hint, area);
+        draw_welcome(frame, block, area);
         return;
     };
 
@@ -319,6 +326,39 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let rect = Rect { x, y: list.y + (i - offset) as u16, width: w as u16, height: 1 };
         app.hits.genre_links.push((rect, genre));
     }
+}
+
+/// First launch (nothing searched or played yet): what you can do.
+fn draw_welcome(frame: &mut Frame, block: Block, area: Rect) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows: [(&str, &str); 6] = [
+        ("/", "search tracks, artists, albums and playlists"),
+        ("#genre", "browse a genre or tag: #nerdcore, #folk punk"),
+        ("paste", "a soundcloud.com link to play it (#t=1:23 starts there)"),
+        ("y", "copy a link to share"),
+        ("h  F", "recently played · favorites"),
+        ("?", "every key"),
+    ];
+    let mut lines = vec![
+        Line::from(vec![Span::raw("☁ ").fg(ORANGE), Span::raw("drift").fg(ORANGE).bold(), Span::raw("wave").fg(AMBER).bold()]),
+        Line::from("SoundCloud in your terminal · no account needed").fg(MUTED),
+        Line::raw(""),
+    ];
+    let key_w = rows.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
+    let text_w = rows.iter().map(|(_, t)| t.width()).max().unwrap_or(0);
+    for (k, what) in rows {
+        // Pad every row to the same width so the column stays aligned when centered.
+        let line = format!("{k:>key_w$}   {what:<text_w$}");
+        let (key, rest) = line.split_at(key_w);
+        lines.push(Line::from(vec![Span::raw(key.to_string()).fg(ORANGE).bold(), Span::raw(rest.to_string()).fg(TEXT)]));
+    }
+    let h = (lines.len() as u16).min(inner.height);
+    let y = inner.y + (inner.height - h) / 2;
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        Rect { y, height: h, ..inner },
+    );
 }
 
 fn draw_settings(frame: &mut Frame, app: &mut App, block: Block, area: Rect) {
@@ -587,79 +627,174 @@ fn playlist_row(p: &Playlist, width: usize) -> Line<'static> {
 fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     let track = app.now_playing().cloned();
     let paused = app.player.is_paused();
+    let spinner = SPINNER[(app.frame / 2) as usize % SPINNER.len()];
 
-    let title = match &track {
-        Some(t) => {
-            let icon = if app.loading {
-                SPINNER[(app.frame / 2) as usize % SPINNER.len()]
-            } else if paused {
-                "⏸"
-            } else {
-                "▶"
-            };
-            let mut spans = vec![
-                Span::raw(format!(" {icon} ")).fg(ORANGE),
-                Span::raw(t.title.clone()).fg(TEXT).bold(),
-                Span::raw("  "),
-                Span::raw(t.user.username.clone()).fg(SKY),
-                Span::raw(" "),
-            ];
-            if app.state.is_favorite(t.id) {
-                spans.push(Span::raw("♥ ").fg(PINK));
-            }
-            if let Some(to) = app.output_label() {
-                spans.push(Span::raw(format!("→ {} ", truncate(&to, 24))).fg(VIOLET));
-            }
-            if let Some(q) = app.quality {
-                spans.push(Span::raw(format!(" {q} ")).fg(Color::Black).bg(if q.starts_with("AAC") {
-                    LIME
-                } else {
-                    AMBER
-                }));
-                spans.push(Span::raw(" "));
-            }
-            Line::from(spans)
-        }
-        None => Line::from(" Nothing playing ").fg(MUTED),
+    let state = match &track {
+        None => Line::from(" ♪ now playing ").fg(MUTED),
+        Some(_) if app.loading => Line::from(format!(" {spinner} loading ")).fg(AMBER),
+        Some(_) if paused => Line::from(" ⏸ paused ").fg(AMBER),
+        Some(_) => Line::from(" ▶ now playing ").fg(ORANGE),
     };
-    let block = panel(title, false);
+    let block = panel(state, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     draw_buttons(frame, app, area);
     draw_modes(frame, app, area);
-    if inner.height < 2 {
+    if inner.height < 3 || inner.width < 20 {
         return;
     }
 
-    // Small square cover on the left (cells are about twice as tall as wide).
-    let mut inner = inner;
+    // Bottom row: what plays next, and messages.
+    let [main, next_row] = Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).areas(inner);
+    draw_up_next(frame, app, next_row);
+
+    // Cover on the left, as tall as the player (cells are ~2:1).
+    let mut content = main;
     if let Some(t) = &track
-        && inner.width >= 60
+        && main.width >= 60
         && let Some(art) = &mut app.art
         && art.has(t.id)
     {
-        let h = inner.height.min(7);
-        let art_area = Rect { x: inner.x + 1, y: inner.y + (inner.height - h) / 2, width: h * 2, height: h };
+        let h = main.height.min(12);
+        let art_area = Rect { x: main.x + 1, y: main.y + (main.height - h) / 2, width: h * 2, height: h };
         art.draw(frame, t.id, art_area);
-        inner.x += art_area.width + 3;
-        inner.width -= art_area.width + 3;
+        content.x += art_area.width + 3;
+        content.width = content.width.saturating_sub(art_area.width + 3);
+    } else {
+        content.x += 1;
+        content.width = content.width.saturating_sub(2);
     }
-
-    let [viz_area, progress_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-
-    // Bars are one cell wide with a one-cell gap.
-    let n_bars = (viz_area.width as usize).div_ceil(2);
-    let active = track.is_some() && !app.loading && !paused;
-    app.spectrum.update(&app.player.ring, n_bars, active);
-    draw_spectrum(frame, &app.spectrum.bars, &app.spectrum.peaks, viz_area);
-    app.hits.spectrum = viz_area;
 
     let (pos, dur) = match &track {
         Some(t) => (app.player.position().as_millis() as u64, t.duration),
         None => (0, 0),
     };
+    let width = content.width as usize;
+    let progress_area = Rect { y: content.bottom() - 1, height: 1, ..content };
+    let info_rows = if content.height >= 4 { 2 } else { 1 };
+    let viz_area = Rect {
+        y: content.y + info_rows,
+        height: content.height.saturating_sub(info_rows + 1),
+        ..content
+    };
+
+    match &track {
+        Some(t) => {
+            // Title, with the favorite heart, output and quality on the right.
+            let mut right = Vec::new();
+            if app.state.is_favorite(t.id) {
+                right.push(Span::raw("♥ ").fg(PINK));
+            }
+            if let Some(to) = app.output_label() {
+                right.push(Span::raw(format!("→ {} ", truncate(&to, 20))).fg(VIOLET));
+            }
+            if let Some(q) = app.quality {
+                let bg = if q.starts_with("AAC") { LIME } else { AMBER };
+                right.push(Span::raw(format!(" {q} ")).fg(Color::Black).bg(bg));
+            }
+            let title = vec![Span::raw(""), Span::raw(t.title.clone()).fg(TEXT).bold()];
+            frame.render_widget(row(title, right, width), Rect { height: 1, ..content });
+
+            if info_rows == 2 {
+                let mut info = vec![Span::raw(t.user.username.clone()).fg(SKY).bold()];
+                if let Some(a) = t.publisher_artist().filter(|a| !a.eq_ignore_ascii_case(&t.user.username)) {
+                    info.push(Span::raw(format!("  ({a})")).fg(MUTED));
+                }
+                let info_y = content.y + 1;
+                if let Some(g) = t.genre.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+                    info.push(Span::raw("  ·  ").fg(FAINT));
+                    let x = content.x + info.iter().map(Span::width).sum::<usize>() as u16;
+                    let w = g.width() as u16;
+                    if x + w <= content.right() {
+                        app.hits.genre_links.push((Rect { x, y: info_y, width: w, height: 1 }, g.to_string()));
+                    }
+                    info.push(Span::raw(g.to_string()).fg(LIME));
+                }
+                if let Some(n) = t.playback_count.filter(|&n| n > 0) {
+                    info.push(Span::raw("  ·  ").fg(FAINT));
+                    info.push(Span::raw(format!("▶ {} plays", fmt_count(n))).fg(MUTED));
+                }
+                frame.render_widget(Line::from(info), Rect { y: info_y, height: 1, ..content });
+            }
+        }
+        None => {
+            let hint = Line::from(vec![
+                Span::raw("Nothing playing. ").fg(MUTED),
+                Span::raw("⏎").fg(ORANGE).bold(),
+                Span::raw(" plays the selected track, or paste a SoundCloud link").fg(MUTED),
+            ]);
+            frame.render_widget(hint, Rect { height: 1, ..content });
+        }
+    }
+
+    // Bars are one cell wide with a one-cell gap.
+    let n_bars = (viz_area.width as usize).div_ceil(2);
+    let active = track.is_some() && !app.loading && !paused;
+    app.spectrum.update(&app.player.ring, n_bars, active);
+    if viz_area.height > 0 {
+        draw_spectrum(frame, &app.spectrum.bars, &app.spectrum.peaks, viz_area);
+        app.hits.spectrum = viz_area;
+    }
     app.hits.progress = draw_progress(frame, pos, dur, app.player.volume(), progress_area);
+}
+
+/// Is this status message about something going wrong?
+fn is_error(status: &str) -> bool {
+    ["Couldn't", "Can't", "failed", "DRM-protected", "Error", "stopped", "refused"]
+        .iter()
+        .any(|w| status.contains(w))
+}
+
+/// "up next  A · B · C" under the player, with messages on the right.
+fn draw_up_next(frame: &mut Frame, app: &mut App, area: Rect) {
+    let mut status_w = 0;
+    if !app.status.is_empty() && area.width > 30 {
+        let room = (area.width as usize * 3 / 5).max(20);
+        let text = format!(" {} ", truncate(&app.status, room - 2));
+        status_w = text.width() as u16;
+        let bg = if is_error(&app.status) { RED } else { AMBER };
+        let rect = Rect { x: area.right() - status_w, width: status_w, ..area };
+        frame.render_widget(Span::raw(text).fg(Color::Black).bg(bg), rect);
+    }
+    let room = area.width.saturating_sub(status_w + 2) as usize;
+    let q = &app.queue;
+    let mut spans = vec![Span::raw(" up next ").fg(TEXT).bg(FAINT), Span::raw(" ")];
+    let next = q.upcoming(6);
+    if next.is_empty() {
+        let msg = if q.current().is_none() {
+            "your queue is empty"
+        } else if q.radio {
+            "∞ radio will add related tracks"
+        } else {
+            "end of the queue: R starts radio"
+        };
+        spans.push(Span::raw(msg).fg(MUTED));
+    } else {
+        for (i, t) in next.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" · ").fg(FAINT));
+            }
+            spans.push(Span::raw(t.title.clone()).fg(if i == 0 { TEXT } else { MUTED }));
+        }
+    }
+    // Cut to fit.
+    let mut line = Vec::new();
+    let mut used = 0;
+    for s in spans {
+        let w = s.width();
+        if used + w > room {
+            let keep = room.saturating_sub(used);
+            if keep > 1 {
+                line.push(Span::styled(truncate(&s.content, keep), s.style));
+                used += keep;
+            }
+            break;
+        }
+        used += w;
+        line.push(s);
+    }
+    frame.render_widget(Line::from(line), area);
+    app.hits.up_next = Rect { width: used as u16, ..area };
 }
 
 /// "♪ Lyrics" and "Genius ↗" buttons on the right of the player's top border.
@@ -682,6 +817,9 @@ fn draw_buttons(frame: &mut Frame, app: &mut App, area: Rect) {
     let popout = " ⧉ ";
     let popout_style = if app.now_playing().is_some() { Style::new().fg(Color::Black).bg(PINK) } else { Style::new().fg(FAINT) };
 
+    let share = " ⎘ share ";
+    let share_style = if app.now_playing().is_some() { Style::new().fg(Color::Black).bg(SKY) } else { Style::new().fg(FAINT) };
+
     let gw = genius.width() as u16;
     let lw = label.width() as u16;
     let pw = popout.width() as u16;
@@ -689,8 +827,14 @@ fn draw_buttons(frame: &mut Frame, app: &mut App, area: Rect) {
     let genius_rect = Rect { x: right.saturating_sub(gw), y: area.y, width: gw, height: 1 };
     let popout_rect = Rect { x: genius_rect.x.saturating_sub(pw + 1), y: area.y, width: pw, height: 1 };
     let lyrics_rect = Rect { x: popout_rect.x.saturating_sub(lw), y: area.y, width: lw, height: 1 };
-    if lyrics_rect.x <= area.x + 2 {
+    if lyrics_rect.x <= area.x + 18 {
         return; // too narrow
+    }
+    let sw = share.width() as u16;
+    let share_rect = Rect { x: lyrics_rect.x.saturating_sub(sw + 1), y: area.y, width: sw, height: 1 };
+    if share_rect.x > area.x + 18 {
+        frame.render_widget(Span::styled(share, share_style), share_rect);
+        app.hits.share_button = share_rect;
     }
     frame.render_widget(Span::styled(label, style), lyrics_rect);
     frame.render_widget(Span::styled(popout, popout_style), popout_rect);
@@ -739,15 +883,6 @@ fn draw_modes(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let hits = &mut app.hits;
     [hits.queue_button, hits.shuffle_button, hits.repeat_button, hits.radio_button] = rects;
-
-    // Messages ("Shuffle on", "Loading…") show briefly on the right.
-    let room = area.right().saturating_sub(x + 3) as usize;
-    if !app.status.is_empty() && room > 8 {
-        let text = format!(" {} ", truncate(&app.status, room - 2));
-        let w = text.width() as u16;
-        let rect = Rect { x: area.right() - 2 - w, y, width: w, height: 1 };
-        frame.render_widget(Span::raw(text).fg(Color::Black).bg(AMBER), rect);
-    }
 }
 
 fn draw_lyrics(frame: &mut Frame, app: &mut App, over: Rect) {
@@ -1103,6 +1238,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             ("←→", "seek"),
             ("l", "lyrics"),
             ("e", "enqueue"),
+            ("y", "share"),
             ("f/F", "favorites"),
             ("q", "quit"),
             ("?", "all keys"),

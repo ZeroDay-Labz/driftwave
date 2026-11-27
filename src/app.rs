@@ -11,7 +11,7 @@ use crate::lyrics_window;
 use crate::mpris::{self, Mpris, SeekDirection};
 use crate::notify::Notifier;
 use crate::output::{self, Output, Row};
-use crate::{player, ui};
+use crate::{api, links, player, ui};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
@@ -27,11 +27,13 @@ use crate::viz::Spectrum;
 pub enum Reply {
     /// Contents for one tab of a view.
     Items { view: u64, tab: usize, result: Result<Vec<Item>> },
-    Resolved(Result<Box<Item>>),
+    Resolved { result: Result<Box<Item>>, start_ms: Option<u64> },
     Audio { generation: u64, result: Result<Prepared> },
     Prefetched { track: u64, result: Result<OpenStream> },
     Lyrics { track: u64, result: Result<Option<lyrics::Found>> },
     Radio(Result<Vec<Track>>),
+    /// A track's link, looked up because the saved copy didn't have one.
+    ShareLink { result: Result<Option<(String, String)>>, at_ms: Option<u64> },
     /// A genre page's top tracks, which also give its artists and related tags.
     TagTop { view: u64, tag: String, result: Result<Vec<Track>> },
     Art { track: u64, result: Result<(std::path::PathBuf, image::DynamicImage)> },
@@ -120,6 +122,11 @@ pub struct App {
     /// A preview track with no full upload elsewhere: play its snippet
     /// instead of searching again.
     snippet_ok: Option<u64>,
+    /// Tracks in a row that failed to play and were skipped, so a queue
+    /// where nothing plays (e.g. no network) stops instead of looping.
+    fail_streak: u32,
+    /// Where to start the next track that begins playing (a link's #t=).
+    pending_seek: Option<u64>,
     /// The next track, already downloading so autoplay starts instantly.
     prefetch: Option<(u64, OpenStream)>,
 
@@ -210,6 +217,8 @@ impl App {
             quality: None,
             generation: 0,
             snippet_ok: None,
+            fail_streak: 0,
+            pending_seek: None,
             prefetch: None,
             status: String::new(),
             status_seen: String::new(),
@@ -316,9 +325,8 @@ impl App {
             self.open_tag(tag.to_string());
             return;
         }
-        if q.starts_with("https://") {
-            self.status = "Resolving link…".into();
-            self.spawn(move |sc| Reply::Resolved(sc.resolve(&q).map(Box::new)));
+        if let Some(link) = links::parse(&q) {
+            self.open_link(link);
             return;
         }
         self.state.last_query = q.clone();
@@ -333,6 +341,32 @@ impl App {
         self.load(v, 3, move |sc| sc.search_playlists(&q4), Item::Playlist);
         // Tracks actually tagged with what was typed ("nerdcore", "folk punk").
         self.load(v, 4, move |sc| sc.tag_tracks(&q5), Item::Track);
+    }
+
+    /// Open a soundcloud.com link: play a track (from its #t= if given), or
+    /// open an artist or playlist.
+    fn open_link(&mut self, link: links::Link) {
+        self.status = "Opening link…".into();
+        self.pending_seek = None;
+        let start_ms = link.start_ms;
+        self.spawn(move |sc| Reply::Resolved { result: sc.resolve(&link).map(Box::new), start_ms });
+    }
+
+    /// Text pasted into the terminal (bracketed paste). A SoundCloud link
+    /// opens right away, wherever it's pasted; other text goes into the
+    /// search box when it's open, and is ignored otherwise (so it can't
+    /// fire a burst of hotkeys).
+    pub fn on_paste(&mut self, text: &str) {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(link) = links::parse(&text) {
+            self.input = link.url.clone();
+            self.mode = Mode::Normal;
+            self.open_link(link);
+        } else if self.mode == Mode::Search {
+            self.input.push_str(&text);
+        } else {
+            self.status = "Paste a soundcloud.com link to play it, or press / to search".into();
+        }
     }
 
     /// What to show at startup when no search was given.
@@ -1051,6 +1085,57 @@ impl App {
         };
     }
 
+    /// Copy a soundcloud.com link to the clipboard: the selected track,
+    /// artist, playlist or genre, or (`now`) the playing track, starting at
+    /// the current position when `at_time`.
+    pub fn share(&mut self, now: bool, at_time: bool) {
+        let selected = if now { None } else { self.views.last().and_then(View::selected).cloned() };
+        let track = match selected {
+            Some(Item::Track(t)) => t,
+            Some(Item::User(u)) => return self.copy_link(u.permalink_url, &u.username, None),
+            Some(Item::Playlist(p)) => return self.copy_link(p.permalink_url, &p.title, None),
+            Some(Item::Tag { name, .. }) => {
+                let url = format!("https://soundcloud.com/tags/{}", crate::tags::encode_path(&name));
+                return self.copy_link(Some(url), &format!("#{name}"), None);
+            }
+            None => match self.now_playing() {
+                Some(t) => t.clone(),
+                None => {
+                    self.status = "Nothing to share yet: select or play a track".into();
+                    return;
+                }
+            },
+        };
+        let playing = self.now_playing().is_some_and(|t| t.id == track.id);
+        let at_ms = (at_time && playing).then(|| self.player.position().as_millis() as u64);
+        if track.permalink_url.is_some() {
+            return self.copy_link(track.permalink_url, &track.title, at_ms);
+        }
+        // Saved by an older version, before links were kept: look it up.
+        self.status = format!("Getting the link to {}…", track.title);
+        let id = track.id;
+        self.spawn(move |sc| Reply::ShareLink {
+            result: sc.tracks_by_ids(&[id]).map(|t| {
+                t.into_iter().next().and_then(|t| Some((t.permalink_url?, t.title)))
+            }),
+            at_ms,
+        });
+    }
+
+    fn copy_link(&mut self, url: Option<String>, what: &str, at_ms: Option<u64>) {
+        let Some(url) = url else {
+            self.status = format!("SoundCloud didn't give a link for {what}");
+            return;
+        };
+        let link = links::share_url(&url, at_ms);
+        let how = crate::clipboard::copy(&link);
+        let at = match at_ms {
+            Some(ms) if ms >= 1000 => format!(" at {}", links::format_time(ms)),
+            _ => String::new(),
+        };
+        self.status = format!("Copied the link to {what}{at} ({how})");
+    }
+
     /// Shift the current track's lyrics timing.
     fn nudge_lyrics(&mut self, ms: i64) {
         let Some(id) = self.now_playing().map(|t| t.id) else { return };
@@ -1125,14 +1210,19 @@ impl App {
                         t.state.select((!items.is_empty()).then_some(0));
                         t.items = items;
                     }
-                    Err(e) => t.error = Some(format!("{e:#}")),
+                    Err(e) => t.error = Some(api::friendly_error(&e)),
                 }
             }
-            Reply::Resolved(Ok(item)) => {
+            Reply::Resolved { result: Ok(item), start_ms } => {
                 self.status.clear();
+                if matches!(*item, Item::Track(_)) {
+                    self.pending_seek = start_ms;
+                }
                 self.open(*item);
             }
-            Reply::Resolved(Err(e)) => self.status = format!("Couldn't open link: {e:#}"),
+            Reply::Resolved { result: Err(e), .. } => {
+                self.status = format!("Couldn't open link: {}", api::friendly_error(&e))
+            }
             Reply::Lyrics { track, result } => {
                 let state = match result {
                     Ok(found) => LyricsState::Ready(found),
@@ -1147,6 +1237,7 @@ impl App {
             }
             Reply::Audio { result: Ok(prepared), .. } => {
                 self.loading = false;
+                self.fail_streak = 0;
                 if let Some(t) = self.queue.current() {
                     self.state.record_play(t);
                     self.state_dirty = true;
@@ -1154,6 +1245,10 @@ impl App {
                 }
                 self.quality = Some(prepared.label());
                 self.player.play(prepared);
+                if let Some(ms) = self.pending_seek.take() {
+                    self.player.seek_to(Duration::from_millis(ms));
+                    self.status = format!("Started at {} (from the link)", links::format_time(ms));
+                }
                 // Keep explanations (e.g. "playing another upload"); drop "Loading…".
                 if self.status.starts_with("Loading ") {
                     self.status.clear();
@@ -1183,7 +1278,7 @@ impl App {
                 self.download = None;
                 self.status = match result {
                     Ok(path) => format!("⤓ Saved {}", path.display()),
-                    Err(e) => format!("Download failed: {e:#}"),
+                    Err(e) => format!("Download failed: {}", api::friendly_error(&e)),
                 };
             }
             Reply::TagTop { view, tag, result } => {
@@ -1206,11 +1301,16 @@ impl App {
                     Err(e) => {
                         for i in [0, 2, 4] {
                             v.tabs[i].loading = false;
-                            v.tabs[i].error = Some(format!("{e:#}"));
+                            v.tabs[i].error = Some(api::friendly_error(&e));
                         }
                     }
                 }
             }
+            Reply::ShareLink { result, at_ms } => match result {
+                Ok(Some((url, title))) => self.copy_link(Some(url), &title, at_ms),
+                Ok(None) => self.status = "That track is no longer on SoundCloud".into(),
+                Err(e) => self.status = format!("Couldn't get the link: {}", api::friendly_error(&e)),
+            },
             Reply::Radio(result) => {
                 self.radio_loading = false;
                 let added = result.map(|t| self.queue.extend_radio(t)).unwrap_or(0);
@@ -1227,7 +1327,9 @@ impl App {
             }
             Reply::Audio { result: Err(e), .. } => {
                 self.loading = false;
-                self.status = format!("Can't play this track: {e:#}");
+                let title = self.queue.current().map(|t| t.title.clone()).unwrap_or_default();
+                self.status = format!("Couldn't play \"{title}\": {}", api::friendly_error(&e));
+                self.skip_failed();
             }
             Reply::Outputs { changed, applied, result } => self.outputs_arrived(changed, applied, result),
             Reply::Alternative { generation, .. } if generation != self.generation => {}
@@ -1255,14 +1357,28 @@ impl App {
                 }
                 _ => {
                     self.loading = false;
-                    self.status = format!("\"{}\" is DRM-protected and no other upload plays; skipping", original.title);
-                    if self.queue.advance(false).is_some() {
-                        let msg = std::mem::take(&mut self.status);
-                        self.play_current();
-                        self.status = msg;
-                    }
+                    self.status = format!("\"{}\" is DRM-protected and no other upload plays", original.title);
+                    self.skip_failed();
                 }
             },
+        }
+    }
+
+    /// The current track can't be played: move on to the next one, keeping
+    /// the explanation in the status line. Gives up after a few failures in
+    /// a row so a dead network doesn't spin through the whole queue.
+    fn skip_failed(&mut self) {
+        const MAX_STREAK: u32 = 5;
+        self.fail_streak += 1;
+        if self.fail_streak >= MAX_STREAK {
+            self.fail_streak = 0;
+            self.status = format!("{}; stopped after {MAX_STREAK} tracks in a row failed", self.status);
+            return;
+        }
+        if self.queue.advance(false).is_some() {
+            let msg = format!("{}; skipping", std::mem::take(&mut self.status));
+            self.play_current();
+            self.status = msg;
         }
     }
 
@@ -1405,6 +1521,8 @@ impl App {
             KeyCode::Char('[') => self.nudge_lyrics(-500),
             KeyCode::Char(']') => self.nudge_lyrics(500),
             KeyCode::Char('c') => self.copy_lyrics(),
+            KeyCode::Char('y') => self.share(false, false),
+            KeyCode::Char('Y') => self.share(true, true),
             KeyCode::Char('L') => self.pop_out_lyrics(),
             KeyCode::Char('o') => self.open_genius(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.player.change_volume(0.05),
@@ -1463,6 +1581,14 @@ impl App {
         let hits = &self.hits;
         if hits.lyrics_button.contains(at) {
             self.toggle_lyrics();
+            return;
+        }
+        if hits.share_button.contains(at) {
+            self.share(true, false);
+            return;
+        }
+        if hits.up_next.contains(at) {
+            self.open_queue();
             return;
         }
         if hits.genius_button.contains(at) {

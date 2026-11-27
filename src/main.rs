@@ -6,6 +6,7 @@ mod clipboard;
 mod hls;
 mod ipc;
 mod library;
+mod links;
 mod lyrics;
 mod lyrics_window;
 mod mpris;
@@ -25,7 +26,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind,
+};
 use ratatui::DefaultTerminal;
 
 use app::{App, Mode};
@@ -53,6 +57,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     app.on_key(key.code, key.modifiers)
                 }
                 Event::Mouse(m) => app.on_mouse(m),
+                Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             }
             if app.quit {
@@ -72,7 +77,9 @@ fn main() -> Result<()> {
         }
         Some("--help" | "-h") => {
             println!(
-                "{} {}: {}\n\nUsage: driftwave [search words | soundcloud.com link]\n\n\
+                "{} {}: {}\n\nUsage: driftwave [search words | #genre | soundcloud.com link]\n\n\
+                 Links can be pasted anywhere in the app; #t=1:23 starts there.\n\
+                 Press y to copy a track's link, Y to copy it at the current time.\n\
                  Press ? inside the app for all keys.",
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -105,14 +112,15 @@ fn main() -> Result<()> {
     // ratatui's panic hook restores the terminal but not mouse reporting.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         hook(info);
     }));
     app.art = Some(art::Art::new()); // queries the terminal: before reading events
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+    // Bracketed paste: a pasted link arrives as one event, not as keystrokes.
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let result = run(&mut terminal, &mut app);
     app.save_state();
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }

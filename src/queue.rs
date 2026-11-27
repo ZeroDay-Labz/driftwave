@@ -216,6 +216,18 @@ impl Queue {
         Some((self.cursor? + 1, self.order.len()))
     }
 
+    /// The next `n` tracks in play order (wrapping around with repeat-all;
+    /// just the current one again with repeat-one).
+    pub fn upcoming(&self, n: usize) -> Vec<&Track> {
+        let Some(c) = self.cursor else { return Vec::new() };
+        let len = self.order.len();
+        match self.repeat {
+            Repeat::One => self.current().into_iter().collect(),
+            Repeat::All => (1..len).take(n).map(|k| &self.tracks[self.order[(c + k) % len]]).collect(),
+            Repeat::Off => self.order[c + 1..].iter().take(n).map(|&i| &self.tracks[i]).collect(),
+        }
+    }
+
     /// Tracks in play order, with the index of the current one.
     pub fn in_order(&self) -> (Vec<Track>, Option<usize>) {
         (self.order.iter().map(|&i| self.tracks[i].clone()).collect(), self.cursor)
@@ -231,6 +243,19 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upcoming_follows_play_order() {
+        let mut q = Queue::default();
+        q.set((1..=5).map(track).collect(), 3);
+        let ids = |q: &Queue| q.upcoming(3).iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(&q), vec![5]);
+        q.repeat = Repeat::All;
+        assert_eq!(ids(&q), vec![5, 1, 2]);
+        q.repeat = Repeat::One;
+        assert_eq!(ids(&q), vec![4]);
+        assert!(Queue::default().upcoming(3).is_empty());
+    }
 
     fn track(id: u64) -> Track {
         serde_json::from_value(serde_json::json!({
